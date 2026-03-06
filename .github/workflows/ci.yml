@@ -40,7 +40,7 @@ jobs:
         run: bun run build:web
 
       - name: Verify CLI entrypoint
-        run: node --no-warnings --experimental-strip-types codex-sessions.ts --help
+        run: node --no-warnings --experimental-strip-types codlogs-sessions.ts --help
 
       - name: Verify npm package contents
         run: npm pack --dry-run
