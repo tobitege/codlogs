@@ -10,7 +10,7 @@ import type { CodexerRPC } from "../shared/rpc.ts";
 
 const DEV_SERVER_PORT = 5173;
 const DEV_SERVER_URL = `http://localhost:${DEV_SERVER_PORT}`;
-const SETTINGS_FILE_NAME = "codexer-settings.json";
+const SETTINGS_FILE_NAME = "codlogs-settings.json";
 const RPC_MAX_REQUEST_TIME_MS = 15 * 60 * 1000;
 
 async function getMainViewUrl(): Promise<string> {
@@ -107,7 +107,7 @@ function startHtmlExportJob(options: {
         outputPath,
       });
       Utils.showNotification({
-        title: "codexer export ready",
+        title: "codlogs export ready",
         body: path.basename(outputPath),
       });
     } catch (error) {
@@ -117,7 +117,7 @@ function startHtmlExportJob(options: {
         outputPath: null,
       });
       Utils.showNotification({
-        title: "codexer export failed",
+        title: "codlogs export failed",
         body: path.basename(options.sessionFilePath),
       });
     } finally {
@@ -237,7 +237,7 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
           outputDirectory,
         });
         Utils.showNotification({
-          title: "codexer export ready",
+          title: "codlogs export ready",
           body: path.basename(outputPath),
         });
         return { outputPath };
@@ -272,7 +272,7 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
 const url = await getMainViewUrl();
 
 mainWindow = new BrowserWindow({
-  title: "codexer",
+  title: "codlogs",
   url,
   rpc,
   frame: {
@@ -284,7 +284,7 @@ mainWindow = new BrowserWindow({
 });
 
 mainWindow.webview.on("dom-ready", () => {
-  console.log("codexer mainview ready");
+  console.log("codlogs mainview ready");
 });
 
-console.log(`codexer started with ${url}`);
+console.log(`codlogs started with ${url}`);

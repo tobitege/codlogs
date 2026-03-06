@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "codexer",
+      "name": "codlogs",
       "dependencies": {
         "electrobun": "1.15.1",
         "react": "^18.3.1",

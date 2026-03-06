@@ -1,26 +1,39 @@
-# codexer
+<p align="center">
+  <img src="./codlogs.png" alt="codlogs" width="220">
+</p>
 
-`codexer` is a read-only Codex session tool with two entry points:
+<p align="center">
+  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white" alt="TypeScript">
+  <img src="https://img.shields.io/badge/Bun-1.x-000000?logo=bun&logoColor=white" alt="Bun">
+  <img src="https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=000000" alt="React">
+  <img src="https://img.shields.io/badge/Electrobun-Desktop-7A5CFA" alt="Electrobun">
+  <img src="https://img.shields.io/badge/@tobitege-000000?logo=x&logoColor=white" alt="X @tobitege">
+</p>
 
-- a global CLI for finding sessions and exporting one `.jsonl` session to Markdown
-- an Electrobun desktop browser for scanning sessions, filtering by folder, and exporting the selected session to `.md`
+# codlogs
+
+`codlogs` is a read-only Codex session tool with two entry points:
+
+- a global CLI for finding sessions and exporting one `.jsonl` session to Markdown or HTML
+- an Electrobun desktop browser for scanning sessions, filtering by folder, and exporting the selected session to `.md` or `.html`
 
 ## CLI
 
 Install it globally from this folder:
 
 ```powershell
-npm install -g d:\github\codexer
+npm install -g d:\github\codlogs
 ```
 
-Use either `codexer` or `codex-sessions`:
+Use either `codlogs` or `codex-sessions`:
 
 ```powershell
-codexer
-codexer d:\github\myDUDreamTool
-codexer /mnt/d/github/myDUDreamTool
-codexer --md C:\Users\tobias\.codex\sessions\2026\03\06\session.jsonl
-codexer --md C:\Users\tobias\.codex\sessions\2026\03\06\session.jsonl --include-images --include-tool-results
+codlogs
+codlogs d:\github\myDUDreamTool
+codlogs /mnt/d/github/myDUDreamTool
+codlogs --md C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl
+codlogs --html C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl
+codlogs --md C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl --include-images --include-tool-results
 ```
 
 Notes:
@@ -29,8 +42,9 @@ Notes:
 - if the folder is inside a git repo, the CLI matches sessions for the repo root by default
 - use `--cwd-only` to match only the folder tree you pass in
 - use `--codex-home PATH` if your Codex data lives somewhere other than `%CODEX_HOME%` or `~/.codex`
-- use `--include-images` with `--md` to write embedded images into a sibling `.assets` folder and link them from Markdown
-- use `--include-tool-results` with `--md` to include tool calls and tool outputs in the export
+- use `--include-images` with `--md` or `--html` to write embedded images into a sibling `.assets` folder
+- use `--html` to export a session as a self-contained HTML transcript
+- use `--include-tool-results` with `--md` or `--html` to include tool calls and tool outputs in the export
 - Windows drive paths, WSL `/mnt/<drive>/...` paths, and WSL UNC paths are treated as aliases of the same repo
 
 ## Desktop App

@@ -2,9 +2,9 @@ import type { ElectrobunConfig } from "electrobun";
 
 export default {
   app: {
-    name: "codexer",
-    identifier: "dev.tobias.codexer",
-    version: "0.2.0",
+    name: "codlogs",
+    identifier: "dev.tobitege.codlogs",
+    version: "1.0.0",
   },
   build: {
     copy: {

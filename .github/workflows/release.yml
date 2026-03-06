@@ -1,0 +1,242 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (for example 1.0.0)'
+        required: true
+        type: string
+      skip_tag:
+        description: 'Skip tag creation when the tag already exists'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.event.inputs.version || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      tag: ${{ steps.validate.outputs.tag }}
+
+    steps:
+      - name: Ensure branch is main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases can only be created from the main branch."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.11.0"
+
+      - name: Validate version metadata
+        id: validate
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          TAG="v$VERSION"
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version format. Use semantic versioning such as 1.0.0."
+            exit 1
+          fi
+
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          APP_VERSION=$(node -e "const fs = require('fs'); const match = fs.readFileSync('electrobun.config.ts', 'utf8').match(/version:\\s*['\\\"]([^'\\\"]+)['\\\"]/); if (!match) { console.error('Could not find app version in electrobun.config.ts.'); process.exit(1); } console.log(match[1]);")
+
+          if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
+            echo "::error::package.json has version $PACKAGE_VERSION but workflow input was $VERSION."
+            exit 1
+          fi
+
+          if [ "$APP_VERSION" != "$VERSION" ]; then
+            echo "::error::electrobun.config.ts has version $APP_VERSION but workflow input was $VERSION."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            if [ "${{ inputs.skip_tag }}" != "true" ]; then
+              echo "::error::Tag $TAG already exists. Re-run with skip_tag enabled if you want to publish from the existing tag."
+              exit 1
+            fi
+          else
+            if [ "${{ inputs.skip_tag }}" = "true" ]; then
+              echo "::error::skip_tag was enabled but tag $TAG does not exist."
+              exit 1
+            fi
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build-npm-package:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.11.0"
+
+      - name: Create npm package tarball
+        run: npm pack
+
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: codlogs-${{ needs.validate.outputs.version }}.tgz
+
+  build-desktop-windows:
+    needs: validate
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.11.0"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Build web bundle
+        run: bun run build:web
+
+      - name: Build stable Windows desktop bundle
+        run: bunx electrobun build --env=stable
+
+      - name: Upload desktop release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows
+          path: |
+            artifacts/stable-win-x64-codlogs-Setup.zip
+            artifacts/stable-win-x64-codlogs.tar.zst
+            artifacts/stable-win-x64-update.json
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - validate
+      - build-npm-package
+      - build-desktop-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release-artifacts
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          mkdir -p ./final
+          find ./release-artifacts -type f -exec cp {} ./final/ \;
+          echo "Release files:"
+          ls -la ./final
+
+      - name: Extract changelog section
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+
+          if [ ! -f CHANGELOG.md ]; then
+            echo "No changelog entry found for this version." > changelog_section.md
+            exit 0
+          fi
+
+          CHANGELOG=$(awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## \\[/ { exit }
+            found { print }
+          ' CHANGELOG.md)
+
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="No changelog entry found for this version."
+          fi
+
+          echo "$CHANGELOG" > changelog_section.md
+
+      - name: Create and push tag
+        if: ${{ !inputs.skip_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ needs.validate.outputs.tag }}
+          git push origin ${{ needs.validate.outputs.tag }}
+
+      - name: Build release notes
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          cat > release_notes.md <<EOF
+          ## What's Changed
+          $(cat changelog_section.md)
+
+          ---
+
+          ## Downloads
+
+          | Asset | Description |
+          |-------|-------------|
+          | \`codlogs-${VERSION}.tgz\` | npm package tarball for the CLI and shared source |
+          | \`stable-win-x64-codlogs-Setup.zip\` | Windows desktop installer bundle |
+          | \`stable-win-x64-codlogs.tar.zst\` | Electrobun desktop update payload |
+          | \`stable-win-x64-update.json\` | Electrobun update manifest |
+          EOF
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: ${{ needs.validate.outputs.tag }}
+          body_path: release_notes.md
+          files: ./final/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add workflow summary
+        run: |
+          echo "## Release Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version: ${{ needs.validate.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: ${{ needs.validate.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"

@@ -10,7 +10,7 @@ const result = childProcess.spawnSync(
   {
     env: {
       ...process.env,
-      CODEXER_COMMAND_NAME: "codexer",
+      CODEXER_COMMAND_NAME: "codlogs",
     },
     stdio: "inherit",
     windowsHide: false,
@@ -18,7 +18,7 @@ const result = childProcess.spawnSync(
 );
 
 if (result.error) {
-  console.error(`Failed to launch codexer: ${result.error.message}`);
+  console.error(`Failed to launch codlogs: ${result.error.message}`);
   process.exit(1);
 }
 

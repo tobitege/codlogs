@@ -1,12 +1,12 @@
 {
-  "name": "codexer",
-  "version": "0.2.0",
+  "name": "codlogs",
+  "version": "1.0.0",
   "private": true,
   "description": "Codex session CLI and Electrobun browser.",
   "license": "UNLICENSED",
   "type": "module",
   "bin": {
-    "codexer": "./codexer.cjs",
+    "codlogs": "./codlogs.cjs",
     "codex-sessions": "./codex-sessions.cjs"
   },
   "scripts": {
@@ -19,7 +19,7 @@
   },
   "files": [
     "README.md",
-    "codexer.cjs",
+    "codlogs.cjs",
     "codex-sessions.cjs",
     "codex-sessions.ts",
     "electrobun.config.ts",

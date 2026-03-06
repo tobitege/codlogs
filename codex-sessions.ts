@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import {
   DEFAULT_CODEX_HOME,
+  exportSessionJsonlToHtml,
   exportSessionJsonlToMarkdown,
   findCodexSessions,
   type FindCodexSessionsResult,
@@ -11,6 +12,7 @@ type ParsedOptions = {
   cwdOnly: boolean;
   includeImages: boolean;
   includeToolCallResults: boolean;
+  htmlExportPath: string | null;
   json: boolean;
   markdownExportPath: string | null;
   targetDirectory: string | null;
@@ -26,6 +28,15 @@ async function main(): Promise<void> {
       includeToolCallResults: options.includeToolCallResults,
     });
     console.log(`Wrote Markdown export: ${markdownPath}`);
+    return;
+  }
+
+  if (options.htmlExportPath !== null) {
+    const htmlPath = await exportSessionJsonlToHtml(options.htmlExportPath, {
+      includeImages: options.includeImages,
+      includeToolCallResults: options.includeToolCallResults,
+    });
+    console.log(`Wrote HTML export: ${htmlPath}`);
     return;
   }
 
@@ -50,6 +61,7 @@ function parseArgs(args: string[], commandName: string): ParsedOptions {
     cwdOnly: false,
     includeImages: false,
     includeToolCallResults: false,
+    htmlExportPath: null,
     json: false,
     markdownExportPath: null,
     targetDirectory: null,
@@ -89,6 +101,17 @@ function parseArgs(args: string[], commandName: string): ParsedOptions {
       continue;
     }
 
+    if (argument === "--html") {
+      const nextArgument = args[index + 1];
+      if (!nextArgument) {
+        throw new Error("Missing value after --html");
+      }
+
+      options.htmlExportPath = nextArgument;
+      index += 1;
+      continue;
+    }
+
     if (argument === "--codex-home") {
       const nextArgument = args[index + 1];
       if (!nextArgument) {
@@ -117,19 +140,27 @@ function parseArgs(args: string[], commandName: string): ParsedOptions {
     throw new Error(`Unknown argument: ${argument}`);
   }
 
-  if (options.markdownExportPath !== null && options.targetDirectory !== null) {
-    throw new Error("Use either [folder] or --md FILE, not both");
+  if (
+    (options.markdownExportPath !== null || options.htmlExportPath !== null) &&
+    options.targetDirectory !== null
+  ) {
+    throw new Error("Use either [folder] or an export flag, not both");
   }
 
-  if (options.markdownExportPath !== null && options.json) {
-    throw new Error("--json cannot be combined with --md");
+  if (options.markdownExportPath !== null && options.htmlExportPath !== null) {
+    throw new Error("Use either --md FILE or --html FILE, not both");
+  }
+
+  if ((options.markdownExportPath !== null || options.htmlExportPath !== null) && options.json) {
+    throw new Error("--json cannot be combined with export flags");
   }
 
   if (
     options.markdownExportPath === null &&
+    options.htmlExportPath === null &&
     (options.includeImages || options.includeToolCallResults)
   ) {
-    throw new Error("--include-images and --include-tool-results require --md FILE");
+    throw new Error("--include-images and --include-tool-results require --md FILE or --html FILE");
   }
 
   return options;
@@ -141,13 +172,15 @@ function printHelp(commandName: string): void {
       "Usage:",
       `  ${commandName} [folder] [--json] [--cwd-only] [--codex-home PATH]`,
       `  ${commandName} --md FILE.jsonl [--include-images] [--include-tool-results]`,
+      `  ${commandName} --html FILE.jsonl [--include-images] [--include-tool-results]`,
       "",
       "Options:",
       "  folder                 Optional folder or repo to inspect. Defaults to the current directory.",
       "  --json                 Print machine-readable JSON.",
       "  --md FILE.jsonl        Convert one Codex session JSONL file into a same-named Markdown file.",
-      "  --include-images       With --md, export embedded images into a sibling .assets folder and link them from Markdown.",
-      "  --include-tool-results With --md, include tool calls and tool outputs in the Markdown transcript.",
+      "  --html FILE.jsonl      Convert one Codex session JSONL file into a same-named HTML file.",
+      "  --include-images       With --md or --html, export embedded images into a sibling .assets folder.",
+      "  --include-tool-results With --md or --html, include tool calls and tool outputs in the exported transcript.",
       "  --cwd-only             Match only the current folder tree, even if a git repo root exists.",
       "  --codex-home PATH      Override the Codex home folder. Defaults to %CODEX_HOME% or ~/.codex.",
       "  -h, --help             Show this help text.",

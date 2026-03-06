@@ -426,7 +426,7 @@ function App() {
       <main className="workspace">
         <header className="hero">
           <div className="hero-content">
-            <h1>codexer</h1>
+            <h1>codlogs</h1>
             <p className="hero-copy">
               Browse and export your Codex sessions with ease.
             </p>
