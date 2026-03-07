@@ -44,6 +44,7 @@ export type FindCodexSessionsResult = {
 
 export type SessionDetailMetrics = {
   interactionCount: number;
+  toolCallCount: number;
   fileSizeBytes: number;
 };
 
@@ -55,8 +56,16 @@ export type MarkdownExportOptions = {
 
 export type HtmlExportOptions = {
   includeImages?: boolean;
+  inlineImages?: boolean;
   includeToolCallResults?: boolean;
   outputDirectory?: string | null;
+  outputPath?: string | null;
+};
+
+export type ExportProgress = {
+  stage: "reading" | "parsing" | "rendering" | "writing";
+  message: string;
+  progressPercent: number;
 };
 
 type SessionIndexRecord = {
@@ -108,18 +117,18 @@ type NormalizedMarkdownExportOptions = {
 
 type NormalizedHtmlExportOptions = {
   includeImages: boolean;
+  inlineImages: boolean;
   includeToolCallResults: boolean;
 };
 
-type MarkdownImageAsset = {
+type ExportImageAsset = {
   fileName: string;
   data: Uint8Array;
 };
 
-type HtmlImageAsset = {
-  fileName: string;
-  data: Uint8Array;
-};
+type MarkdownImageAsset = ExportImageAsset;
+
+type HtmlImageAsset = ExportImageAsset;
 
 type MarkdownRenderContext = {
   assetDirectoryName: string;
@@ -140,6 +149,18 @@ type RenderedMessageContent = {
   imageMarkdown: string[];
 };
 
+type ExportRuntimeOptions = {
+  signal?: AbortSignal;
+  onProgress?: (progress: ExportProgress) => void | Promise<void>;
+};
+
+type ExportLoopProgressOptions = {
+  stage: ExportProgress["stage"];
+  startPercent: number;
+  endPercent: number;
+  message: string;
+};
+
 export const DEFAULT_CODEX_HOME = path.join(os.homedir(), ".codex");
 
 const FIRST_LINE_READ_BYTES = 64 * 1024;
@@ -152,6 +173,14 @@ const WSL_UNC_PATH_CANDIDATE_REGEX =
   /\\\\wsl(?:\.localhost)?\\[^\\/:*?"<>|\r\n]+(?:\\[^\\/:*?"<>|\r\n]+)*/gi;
 const WSL_MOUNT_PATH_CANDIDATE_REGEX = /\/mnt\/[a-z](?:\/[^\s"'<>|`]+)*/gi;
 const ENVIRONMENT_CWD_REGEX = /<cwd>([^<]+)<\/cwd>/gi;
+const EXPORT_PROGRESS_PULSE_RECORD_INTERVAL = 100;
+
+class ExportCancelledError extends Error {
+  constructor() {
+    super("Export cancelled.");
+    this.name = "ExportCancelledError";
+  }
+}
 
 export async function findCodexSessions(
   options: FindCodexSessionsOptions = {},
@@ -269,11 +298,21 @@ export async function getSessionDetailMetrics(
   const records = parseJsonlRecords(content);
   let responseItemUserMessages = 0;
   let eventUserMessages = 0;
+  let toolCallCount = 0;
 
   for (const record of records) {
     if (record.type === "response_item") {
       const item = asObject(record.payload);
-      if (!item || item.type !== "message" || item.role !== "user") {
+      if (!item || typeof item.type !== "string") {
+        continue;
+      }
+
+      if (item.type === "function_call" || item.type === "custom_tool_call") {
+        toolCallCount += 1;
+        continue;
+      }
+
+      if (item.type !== "message" || item.role !== "user") {
         continue;
       }
 
@@ -295,6 +334,7 @@ export async function getSessionDetailMetrics(
   return {
     interactionCount:
       responseItemUserMessages > 0 ? responseItemUserMessages : eventUserMessages,
+    toolCallCount,
     fileSizeBytes: stat.size,
   };
 }
@@ -302,6 +342,7 @@ export async function getSessionDetailMetrics(
 export async function exportSessionJsonlToMarkdown(
   inputPath: string,
   options: MarkdownExportOptions = {},
+  runtimeOptions: ExportRuntimeOptions = {},
 ): Promise<string> {
   const sessionFilePath = resolveFilesystemPath(inputPath);
   if (!(await pathExists(sessionFilePath))) {
@@ -312,8 +353,13 @@ export async function exportSessionJsonlToMarkdown(
     throw new Error(`Expected a .jsonl file: ${sessionFilePath}`);
   }
 
+  await reportExportProgress(runtimeOptions, {
+    stage: "reading",
+    message: "Reading session file...",
+    progressPercent: 4,
+  });
   const content = await fs.readFile(sessionFilePath, "utf8");
-  const records = parseJsonlRecords(content);
+  const records = await parseJsonlRecordsForExport(content, runtimeOptions);
   const normalizedOptions = normalizeMarkdownExportOptions(options);
   const outputName = path.parse(sessionFilePath).name;
   const outputDirectory = normalizeOptionalPathInput(options.outputDirectory);
@@ -321,32 +367,48 @@ export async function exportSessionJsonlToMarkdown(
     ? resolveFilesystemPath(outputDirectory)
     : path.dirname(sessionFilePath);
   const assetDirectoryName = `${outputName}.assets`;
-  const { markdown, assets } = buildMarkdownExport(
+  const { markdown, assets } = await buildMarkdownExport(
     sessionFilePath,
     records,
     normalizedOptions,
     assetDirectoryName,
+    runtimeOptions,
   );
+  await reportExportProgress(runtimeOptions, {
+    stage: "writing",
+    message: "Writing Markdown export...",
+    progressPercent: 86,
+  });
   await fs.mkdir(outputDirectoryPath, { recursive: true });
   const outputPath = path.join(outputDirectoryPath, `${outputName}.md`);
   await fs.writeFile(outputPath, markdown, "utf8");
 
   if (assets.length > 0) {
-    const assetDirectoryPath = path.join(outputDirectoryPath, assetDirectoryName);
-    await fs.mkdir(assetDirectoryPath, { recursive: true });
-    await Promise.all(
-      assets.map((asset) =>
-        fs.writeFile(path.join(assetDirectoryPath, asset.fileName), asset.data),
-      ),
+    await writeExportAssets(
+      path.join(outputDirectoryPath, assetDirectoryName),
+      assets,
+      runtimeOptions,
+      {
+        stage: "writing",
+        startPercent: 90,
+        endPercent: 99,
+        message: "Writing image assets...",
+      },
     );
   }
 
+  await reportExportProgress(runtimeOptions, {
+    stage: "writing",
+    message: "Markdown export ready.",
+    progressPercent: 100,
+  });
   return outputPath;
 }
 
 export async function exportSessionJsonlToHtml(
   inputPath: string,
   options: HtmlExportOptions = {},
+  runtimeOptions: ExportRuntimeOptions = {},
 ): Promise<string> {
   const sessionFilePath = resolveFilesystemPath(inputPath);
   if (!(await pathExists(sessionFilePath))) {
@@ -357,39 +419,173 @@ export async function exportSessionJsonlToHtml(
     throw new Error(`Expected a .jsonl file: ${sessionFilePath}`);
   }
 
+  await reportExportProgress(runtimeOptions, {
+    stage: "reading",
+    message: "Reading session file...",
+    progressPercent: 4,
+  });
   const content = await fs.readFile(sessionFilePath, "utf8");
-  const records = parseJsonlRecords(content);
+  const records = await parseJsonlRecordsForExport(content, runtimeOptions);
   const normalizedOptions = normalizeHtmlExportOptions(options);
   const outputName = path.parse(sessionFilePath).name;
   const outputDirectory = normalizeOptionalPathInput(options.outputDirectory);
-  const outputDirectoryPath = outputDirectory
-    ? resolveFilesystemPath(outputDirectory)
-    : path.dirname(sessionFilePath);
+  const explicitOutputPath = normalizeOptionalPathInput(options.outputPath);
   const assetDirectoryName = `${outputName}.assets`;
+  const outputPath = explicitOutputPath
+    ? ensureHtmlOutputPath(resolveFilesystemPath(explicitOutputPath))
+    : path.join(
+        outputDirectory ? resolveFilesystemPath(outputDirectory) : path.dirname(sessionFilePath),
+        `${outputName}.html`,
+      );
+  const outputDirectoryPath = path.dirname(outputPath);
 
-  // Process buildHtmlExport in a way that doesn't block the event loop
-  const { html, assets } = buildHtmlExport(
+  const { html, assets } = await buildHtmlExport(
     sessionFilePath,
     records,
     normalizedOptions,
     assetDirectoryName,
+    runtimeOptions,
   );
-  
+
+  await reportExportProgress(runtimeOptions, {
+    stage: "writing",
+    message: "Writing HTML export...",
+    progressPercent: 86,
+  });
   await fs.mkdir(outputDirectoryPath, { recursive: true });
-  const outputPath = path.join(outputDirectoryPath, `${outputName}.html`);
   await fs.writeFile(outputPath, html, "utf8");
 
   if (assets.length > 0) {
-    const assetDirectoryPath = path.join(outputDirectoryPath, assetDirectoryName);
-    await fs.mkdir(assetDirectoryPath, { recursive: true });
-    await Promise.all(
-      assets.map((asset) =>
-        fs.writeFile(path.join(assetDirectoryPath, asset.fileName), asset.data),
-      ),
+    await writeExportAssets(
+      path.join(outputDirectoryPath, assetDirectoryName),
+      assets,
+      runtimeOptions,
+      {
+        stage: "writing",
+        startPercent: 90,
+        endPercent: 99,
+        message: "Writing image assets...",
+      },
     );
   }
 
+  await reportExportProgress(runtimeOptions, {
+    stage: "writing",
+    message: "HTML export ready.",
+    progressPercent: 100,
+  });
   return outputPath;
+}
+
+async function reportExportProgress(
+  runtimeOptions: ExportRuntimeOptions,
+  progress: ExportProgress,
+): Promise<void> {
+  throwIfExportCancelled(runtimeOptions.signal);
+  await runtimeOptions.onProgress?.({
+    ...progress,
+    progressPercent: Math.max(0, Math.min(100, Math.round(progress.progressPercent))),
+  });
+  throwIfExportCancelled(runtimeOptions.signal);
+}
+
+function throwIfExportCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new ExportCancelledError();
+  }
+}
+
+async function parseJsonlRecordsForExport(
+  content: string,
+  runtimeOptions: ExportRuntimeOptions,
+): Promise<JsonlRecord[]> {
+  const records: JsonlRecord[] = [];
+  const lines = content.split(/\r?\n/);
+  const totalLines = Math.max(lines.length, 1);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].replace(/^\uFEFF/, "").trim();
+    if (!line) {
+      if (shouldPulseExportProgress(index, totalLines)) {
+        await pulseExportLoop(runtimeOptions, index + 1, totalLines, {
+          stage: "parsing",
+          startPercent: 10,
+          endPercent: 28,
+          message: "Parsing session records...",
+        });
+      }
+      continue;
+    }
+
+    try {
+      records.push(JSON.parse(line) as JsonlRecord);
+    } catch {
+      // Skip malformed lines so one bad record does not block the export.
+    }
+
+    if (shouldPulseExportProgress(index, totalLines)) {
+      await pulseExportLoop(runtimeOptions, index + 1, totalLines, {
+        stage: "parsing",
+        startPercent: 10,
+        endPercent: 28,
+        message: "Parsing session records...",
+      });
+    }
+  }
+
+  await reportExportProgress(runtimeOptions, {
+    stage: "parsing",
+    message: "Session records parsed.",
+    progressPercent: 28,
+  });
+  return records;
+}
+
+function shouldPulseExportProgress(index: number, total: number): boolean {
+  return (
+    index === 0 ||
+    index + 1 === total ||
+    (index + 1) % EXPORT_PROGRESS_PULSE_RECORD_INTERVAL === 0
+  );
+}
+
+async function pulseExportLoop(
+  runtimeOptions: ExportRuntimeOptions,
+  completed: number,
+  total: number,
+  options: ExportLoopProgressOptions,
+): Promise<void> {
+  const progressRatio = total <= 0 ? 1 : completed / total;
+  const progressPercent =
+    options.startPercent + (options.endPercent - options.startPercent) * progressRatio;
+  await reportExportProgress(runtimeOptions, {
+    stage: options.stage,
+    message: options.message,
+    progressPercent,
+  });
+  await yieldForExportLoop();
+}
+
+async function yieldForExportLoop(): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
+async function writeExportAssets(
+  assetDirectoryPath: string,
+  assets: ExportImageAsset[],
+  runtimeOptions: ExportRuntimeOptions,
+  progressOptions: ExportLoopProgressOptions,
+): Promise<void> {
+  await fs.mkdir(assetDirectoryPath, { recursive: true });
+
+  for (let index = 0; index < assets.length; index += 1) {
+    throwIfExportCancelled(runtimeOptions.signal);
+    const asset = assets[index];
+    await fs.writeFile(path.join(assetDirectoryPath, asset.fileName), asset.data);
+    await pulseExportLoop(runtimeOptions, index + 1, assets.length, progressOptions);
+  }
 }
 
 function normalizeMarkdownExportOptions(
@@ -406,8 +602,15 @@ function normalizeHtmlExportOptions(
 ): NormalizedHtmlExportOptions {
   return {
     includeImages: options.includeImages === true,
+    inlineImages: options.inlineImages !== false,
     includeToolCallResults: options.includeToolCallResults === true,
   };
+}
+
+function ensureHtmlOutputPath(outputPath: string): string {
+  return path.extname(outputPath).toLowerCase() === ".html"
+    ? outputPath
+    : `${outputPath}.html`;
 }
 
 function normalizeOptionalPathInput(
@@ -860,12 +1063,13 @@ function looksLikeJsonStructuredText(value: string): boolean {
   );
 }
 
-function buildHtmlExport(
+async function buildHtmlExport(
   sessionFilePath: string,
   records: JsonlRecord[],
   options: NormalizedHtmlExportOptions,
   assetDirectoryName: string,
-): { html: string; assets: HtmlImageAsset[] } {
+  runtimeOptions: ExportRuntimeOptions,
+): Promise<{ html: string; assets: HtmlImageAsset[] }> {
   const sessionMeta = findSessionExportMetadata(records);
   if (!sessionMeta) {
     throw new Error(`No session_meta record found in ${sessionFilePath}`);
@@ -880,8 +1084,17 @@ function buildHtmlExport(
     options,
   };
 
-  for (const record of records) {
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
     if (record.type !== "response_item") {
+      if (shouldPulseExportProgress(index, records.length)) {
+        await pulseExportLoop(runtimeOptions, index + 1, records.length, {
+          stage: "rendering",
+          startPercent: 32,
+          endPercent: 82,
+          message: "Rendering HTML transcript...",
+        });
+      }
       continue;
     }
 
@@ -913,7 +1126,22 @@ function buildHtmlExport(
     if (rendered) {
       transcriptSections.push(numberMarkdownTranscriptEntry(rendered, transcriptSections.length + 1));
     }
+
+    if (shouldPulseExportProgress(index, records.length)) {
+      await pulseExportLoop(runtimeOptions, index + 1, records.length, {
+        stage: "rendering",
+        startPercent: 32,
+        endPercent: 82,
+        message: "Rendering HTML transcript...",
+      });
+    }
   }
+
+  await reportExportProgress(runtimeOptions, {
+    stage: "rendering",
+    message: "HTML transcript rendered.",
+    progressPercent: 82,
+  });
 
   const title = sessionMeta.id;
   const styles = `
@@ -1089,6 +1317,7 @@ function buildHtmlExport(
       <div class="meta-item"><b>CLI:</b> ${escapeHtml(sessionMeta.cliVersion ?? "unknown")}</div>
       <div class="meta-item"><b>Source:</b> ${escapeHtml(sessionMeta.source ?? "unknown")}</div>
       <div class="meta-item"><b>Model:</b> ${escapeHtml(sessionMeta.modelProvider ?? "unknown")}</div>
+      <div class="meta-item"><b>Images:</b> ${escapeHtml(describeHtmlImageMode(options))}</div>
       <div class="meta-item"><b>Exported:</b> ${escapeHtml(new Date().toISOString())}</div>
     </div>
   </header>
@@ -1329,16 +1558,27 @@ function persistHtmlImageReference(
   context: HtmlRenderContext,
 ): string | null {
   if (/^data:image\//i.test(imageSource)) {
-    const asset = createImageAssetFromDataUrl(imageSource, context as any); // Cast context to any because createImageAssetFromDataUrl expects MarkdownRenderContext but it's compatible
+    if (context.options.inlineImages) {
+      return imageSource;
+    }
+
+    const asset = createImageAssetFromDataUrl(imageSource, context);
     if (!asset) {
       return null;
     }
-
     context.assets.push(asset);
     return `./${context.assetDirectoryName}/${asset.fileName}`;
   }
 
   return imageSource;
+}
+
+function describeHtmlImageMode(options: NormalizedHtmlExportOptions): string {
+  if (!options.includeImages) {
+    return "not included";
+  }
+
+  return options.inlineImages ? "embedded inline" : "saved to asset folder";
 }
 
 function escapeHtml(text: string): string {
@@ -1350,12 +1590,13 @@ function escapeHtml(text: string): string {
     .replace(/'/g, "&#039;");
 }
 
-function buildMarkdownExport(
+async function buildMarkdownExport(
   sessionFilePath: string,
   records: JsonlRecord[],
   options: NormalizedMarkdownExportOptions,
   assetDirectoryName: string,
-): { markdown: string; assets: MarkdownImageAsset[] } {
+  runtimeOptions: ExportRuntimeOptions,
+): Promise<{ markdown: string; assets: MarkdownImageAsset[] }> {
   const sessionMeta = findSessionExportMetadata(records);
   if (!sessionMeta) {
     throw new Error(`No session_meta record found in ${sessionFilePath}`);
@@ -1370,8 +1611,17 @@ function buildMarkdownExport(
     options,
   };
 
-  for (const record of records) {
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
     if (record.type !== "response_item") {
+      if (shouldPulseExportProgress(index, records.length)) {
+        await pulseExportLoop(runtimeOptions, index + 1, records.length, {
+          stage: "rendering",
+          startPercent: 32,
+          endPercent: 82,
+          message: "Rendering Markdown transcript...",
+        });
+      }
       continue;
     }
 
@@ -1403,7 +1653,22 @@ function buildMarkdownExport(
     if (rendered) {
       transcriptSections.push(rendered);
     }
+
+    if (shouldPulseExportProgress(index, records.length)) {
+      await pulseExportLoop(runtimeOptions, index + 1, records.length, {
+        stage: "rendering",
+        startPercent: 32,
+        endPercent: 82,
+        message: "Rendering Markdown transcript...",
+      });
+    }
   }
+
+  await reportExportProgress(runtimeOptions, {
+    stage: "rendering",
+    message: "Markdown transcript rendered.",
+    progressPercent: 82,
+  });
 
   const headerLines = [
     "# Codex Session Export",
@@ -1769,8 +2034,8 @@ function persistImageReference(
 
 function createImageAssetFromDataUrl(
   dataUrl: string,
-  context: MarkdownRenderContext,
-): MarkdownImageAsset | null {
+  context: { nextImageIndex: number },
+): ExportImageAsset | null {
   const match = dataUrl.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/i);
   if (!match) {
     return null;

@@ -17,14 +17,23 @@ type AppliedQuery = {
 };
 
 type ExportState = {
-  kind: "idle" | "working" | "success" | "error";
+  kind: "idle" | "working" | "success" | "error" | "cancelled";
+  progressPercent: number;
+  stage: string;
   message: string;
   outputPath: string | null;
+};
+
+type ExportFormat = "markdown" | "html";
+
+type ExportDialogState = {
+  format: ExportFormat;
 };
 
 type SessionDetailMetricsState = {
   kind: "idle" | "loading" | "ready" | "error";
   interactionCount: number | null;
+  toolCallCount: number | null;
   fileSizeBytes: number | null;
 };
 
@@ -128,12 +137,17 @@ function formatFileSize(value: number | null): string {
   return `${size >= 100 ? size.toFixed(0) : size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unitIndex]}`;
 }
 
-function formatInteractionCount(value: number | null): string {
-  if (value === null) {
+function formatInteractionSummary(
+  interactionCount: number | null,
+  toolCallCount: number | null,
+): string {
+  if (interactionCount === null || toolCallCount === null) {
     return "Loading...";
   }
 
-  return `${value} ${value === 1 ? "prompt" : "prompts"}`;
+  const promptLabel = `${interactionCount} ${interactionCount === 1 ? "prompt" : "prompts"}`;
+  const toolCallLabel = `${toolCallCount} ${toolCallCount === 1 ? "tool call" : "tool calls"}`;
+  return `${promptLabel} / ${toolCallLabel}`;
 }
 
 function matchesSearch(session: SessionMetaMatch, query: string): boolean {
@@ -187,6 +201,46 @@ function delay(milliseconds: number): Promise<void> {
   });
 }
 
+function formatExportLabel(format: ExportFormat): string {
+  return format === "markdown" ? "Markdown" : "HTML";
+}
+
+function formatExportStateTitle(kind: ExportState["kind"]): string {
+  switch (kind) {
+    case "working":
+      return "Exporting...";
+    case "success":
+      return "Export complete";
+    case "error":
+      return "Export failed";
+    case "cancelled":
+      return "Export cancelled";
+    default:
+      return "Ready to export";
+  }
+}
+
+function htmlExportUsesFilePicker(
+  includeImages: boolean,
+  inlineImages: boolean,
+): boolean {
+  return !includeImages || inlineImages;
+}
+
+function getExportDestinationHint(
+  format: ExportFormat,
+  includeImages: boolean,
+  inlineImages: boolean,
+): string {
+  if (format === "markdown") {
+    return "Choose a folder and codlogs will write the Markdown file into it.";
+  }
+
+  return htmlExportUsesFilePicker(includeImages, inlineImages)
+    ? "Save a single self-contained HTML file."
+    : "Choose a folder and codlogs will write the HTML file plus a sibling .assets folder.";
+}
+
 function App() {
   const [result, setResult] = useState<FindCodexSessionsResult | null>(null);
   const [codexHome, setCodexHome] = useState("");
@@ -210,23 +264,30 @@ function App() {
     useState<SessionDetailMetricsState>({
       kind: "idle",
       interactionCount: null,
+      toolCallCount: null,
       fileSizeBytes: null,
     });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [exportState, setExportState] = useState<ExportState>({
     kind: "idle",
+    progressPercent: 0,
+    stage: "idle",
     message: "",
     outputPath: null,
   });
   const [exportImages, setExportImages] = useState(false);
+  const [exportInlineImages, setExportInlineImages] = useState(true);
   const [exportToolCallResults, setExportToolCallResults] = useState(false);
+  const [exportDialog, setExportDialog] = useState<ExportDialogState | null>(null);
   const codexHomeRef = useRef(codexHome);
   const folderPathRef = useRef(folderPath);
   const loadRequestIdRef = useRef(0);
   const detailRequestIdRef = useRef(0);
   const exportRequestIdRef = useRef(0);
+  const activeExportJobIdRef = useRef<string | null>(null);
   const initialWindowRefreshDoneRef = useRef(false);
+  const [exportCancelPending, setExportCancelPending] = useState(false);
 
   const deferredSearchQuery = useDeferredValue(searchQuery);
 
@@ -241,6 +302,23 @@ function App() {
   useEffect(() => {
     folderPathRef.current = folderPath;
   }, [folderPath]);
+
+  useEffect(() => {
+    if (!exportDialog) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setExportDialog(null);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [exportDialog]);
 
   const filteredSessions = (result?.sessions ?? []).filter((session) => {
     if (session.kind === "live" && !showLiveSessions) {
@@ -277,6 +355,7 @@ function App() {
       setSessionDetailMetricsState({
         kind: "idle",
         interactionCount: null,
+        toolCallCount: null,
         fileSizeBytes: null,
       });
       return;
@@ -286,6 +365,7 @@ function App() {
       setSessionDetailMetricsState({
         kind: "ready",
         interactionCount: activeSessionDetailMetrics.interactionCount,
+        toolCallCount: activeSessionDetailMetrics.toolCallCount,
         fileSizeBytes: activeSessionDetailMetrics.fileSizeBytes,
       });
       return;
@@ -296,6 +376,7 @@ function App() {
     setSessionDetailMetricsState({
       kind: "loading",
       interactionCount: null,
+      toolCallCount: null,
       fileSizeBytes: null,
     });
 
@@ -316,6 +397,7 @@ function App() {
         setSessionDetailMetricsState({
           kind: "ready",
           interactionCount: metrics.interactionCount,
+          toolCallCount: metrics.toolCallCount,
           fileSizeBytes: metrics.fileSizeBytes,
         });
       } catch {
@@ -326,6 +408,7 @@ function App() {
         setSessionDetailMetricsState({
           kind: "error",
           interactionCount: null,
+          toolCallCount: null,
           fileSizeBytes: null,
         });
       }
@@ -407,90 +490,133 @@ function App() {
     }
   }
 
-  async function exportActiveSessionMarkdown(): Promise<void> {
-    await exportActiveSession("markdown");
+  function openExportDialog(format: ExportFormat): void {
+    if (!activeSession || exportState.kind === "working") {
+      return;
+    }
+
+    setExportDialog({ format });
   }
 
-  async function exportActiveSessionHtml(): Promise<void> {
-    await exportActiveSession("html");
+  async function submitExportDialog(): Promise<void> {
+    if (!exportDialog) {
+      return;
+    }
+
+    const { format } = exportDialog;
+    setExportDialog(null);
+    await exportActiveSession(format);
   }
 
-  async function exportActiveSession(format: "markdown" | "html"): Promise<void> {
+  async function exportActiveSession(format: ExportFormat): Promise<void> {
     if (!activeSession) {
       return;
     }
 
     const exportRequestId = exportRequestIdRef.current + 1;
     exportRequestIdRef.current = exportRequestId;
+    activeExportJobIdRef.current = null;
+    setExportCancelPending(false);
     let outputDirectory: string | null = null;
+    let outputPath: string | null = null;
+    const label = formatExportLabel(format);
 
     try {
-      const response = await getRpc().request.pickExportDirectory({
-        sessionFilePath: activeSession.file,
-      });
-      outputDirectory = response.path;
+      if (format === "markdown") {
+        const response = await getRpc().request.pickExportDirectory({
+          sessionFilePath: activeSession.file,
+        });
+        outputDirectory = response.path;
+      } else {
+        const response = await getRpc().request.pickHtmlExportDestination({
+          sessionFilePath: activeSession.file,
+          includeImages: exportImages,
+          inlineImages: exportInlineImages,
+        });
+        if (response.selectionKind === "directory") {
+          outputDirectory = response.path;
+        } else {
+          outputPath = response.path;
+        }
+      }
     } catch (pickError) {
       setExportState({
         kind: "error",
+        progressPercent: 0,
+        stage: "error",
         message: asErrorMessage(pickError),
         outputPath: null,
       });
       return;
     }
 
-    if (!outputDirectory) {
+    if (!outputDirectory && !outputPath) {
       setExportState({
         kind: "idle",
+        progressPercent: 0,
+        stage: "idle",
         message: "Export cancelled.",
         outputPath: null,
       });
       return;
     }
 
-    const label = format === "markdown" ? "Markdown" : "HTML";
-
     setExportState({
       kind: "working",
-      message: `Creating ${label} export...`,
+      progressPercent: 4,
+      stage: "starting",
+      message: `Preparing ${label} export...`,
       outputPath: null,
     });
 
     try {
       if (format === "markdown") {
-        const { outputPath } = await getRpc().request.exportSessionMarkdown({
+        const { jobId } = await getRpc().request.startSessionMarkdownExport({
           sessionFilePath: activeSession.file,
           includeImages: exportImages,
           includeToolCallResults: exportToolCallResults,
           outputDirectory,
         });
-
-        if (exportRequestId !== exportRequestIdRef.current) {
-          return;
-        }
-
-        setExportState({
-          kind: "success",
-          message: `${label} written to ${outputPath}`,
+        activeExportJobIdRef.current = jobId;
+      } else {
+        const { jobId } = await getRpc().request.startSessionHtmlExport({
+          sessionFilePath: activeSession.file,
+          includeImages: exportImages,
+          inlineImages: exportInlineImages,
+          includeToolCallResults: exportToolCallResults,
+          outputDirectory,
           outputPath,
         });
-        return;
+        activeExportJobIdRef.current = jobId;
       }
 
-      const { jobId } = await getRpc().request.startSessionHtmlExport({
-        sessionFilePath: activeSession.file,
-        includeImages: exportImages,
-        includeToolCallResults: exportToolCallResults,
-        outputDirectory,
-      });
-
-      while (exportRequestId === exportRequestIdRef.current) {
+      while (exportRequestId === exportRequestIdRef.current && activeExportJobIdRef.current) {
+        const jobId = activeExportJobIdRef.current;
+        if (!jobId) {
+          break;
+        }
         const status = await getRpc().request.getExportJobStatus({ jobId });
         if (exportRequestId !== exportRequestIdRef.current) {
           return;
         }
 
+        if (status.kind === "cancelled") {
+          activeExportJobIdRef.current = null;
+          setExportCancelPending(false);
+          setExportState({
+            kind: "cancelled",
+            progressPercent: status.progressPercent,
+            stage: status.stage,
+            message: status.message,
+            outputPath: null,
+          });
+          return;
+        }
+
         setExportState(status);
         if (status.kind !== "working") {
+          activeExportJobIdRef.current = null;
+          setExportCancelPending(false);
           return;
         }
 
@@ -501,9 +627,43 @@ function App() {
         return;
       }
 
+      activeExportJobIdRef.current = null;
+      setExportCancelPending(false);
       setExportState({
         kind: "error",
+        progressPercent: 0,
+        stage: "error",
         message: asErrorMessage(exportError),
+        outputPath: null,
+      });
+    }
+  }
+
+  async function cancelActiveExport(): Promise<void> {
+    const jobId = activeExportJobIdRef.current;
+    if (!jobId || exportCancelPending) {
+      return;
+    }
+
+    setExportCancelPending(true);
+    setExportState((current) =>
+      current.kind === "working"
+        ? {
+            ...current,
+            message: "Cancelling export...",
+          }
+        : current,
+    );
+
+    try {
+      await getRpc().request.cancelExportJob({ jobId });
+    } catch (cancelError) {
+      setExportCancelPending(false);
+      setExportState({
+        kind: "error",
+        progressPercent: 0,
+        stage: "error",
+        message: asErrorMessage(cancelError),
         outputPath: null,
       });
     }
@@ -728,14 +888,41 @@ function App() {
                     <button className="ghost-button" onClick={() => void revealPath(activeSession.file)}>
                       Reveal JSONL
                     </button>
-                    <button className="primary-button" onClick={() => void exportActiveSessionMarkdown()}>
+                    <button
+                      className="primary-button"
+                      disabled={exportState.kind === "working"}
+                      onClick={() => openExportDialog("markdown")}
+                    >
                       Export Markdown
                     </button>
-                    <button className="primary-button" onClick={() => void exportActiveSessionHtml()}>
+                    <button
+                      className="primary-button"
+                      disabled={exportState.kind === "working"}
+                      onClick={() => openExportDialog("html")}
+                    >
                       Export HTML
                     </button>
                   </div>
                 </div>
+
+                {exportState.kind !== "idle" && exportState.kind !== "working" && (
+                  <div className={`status-banner export-status-inline status-${exportState.kind}`}>
+                    <div className="status-info">
+                      <strong>{formatExportStateTitle(exportState.kind)}</strong>
+                      <p>{exportState.message}</p>
+                    </div>
+                    {exportState.outputPath && (
+                      <div className="filter-actions">
+                        <button className="ghost-button" onClick={() => void revealPath(exportState.outputPath)}>
+                          Reveal
+                        </button>
+                        <button className="ghost-button" onClick={() => void openPath(exportState.outputPath)}>
+                          Open
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 <div className="detail-meta-grid">
                   <div className="meta-item">
@@ -757,7 +944,10 @@ function App() {
                     value={
                       sessionDetailMetricsState.kind === "error"
                         ? "Unavailable"
-                        : formatInteractionCount(sessionDetailMetricsState.interactionCount)
+                        : formatInteractionSummary(
+                            sessionDetailMetricsState.interactionCount,
+                            sessionDetailMetricsState.toolCallCount,
+                          )
                     }
                   />
                   <MetaItem
@@ -772,49 +962,6 @@ function App() {
                   <MetaItem label="Source File" value={formatDisplayPath(activeSession.file)} />
                 </div>
 
-                <div className="export-section">
-                  <h3>Export Options</h3>
-                  <div className="export-options">
-                    <label className="checkbox-label">
-                      <input
-                        type="checkbox"
-                        checked={exportImages}
-                        onChange={(event) => setExportImages(event.target.checked)}
-                      />
-                      <span>Include captured images</span>
-                    </label>
-                    <label className="checkbox-label">
-                      <input
-                        type="checkbox"
-                        checked={exportToolCallResults}
-                        onChange={(event) => setExportToolCallResults(event.target.checked)}
-                      />
-                      <span>Include tool calls and results</span>
-                    </label>
-                  </div>
-
-                  <div className={`status-banner status-${exportState.kind}`}>
-                    <div className="status-info">
-                      <strong>
-                        {exportState.kind === "idle" ? "Ready to export" :
-                         exportState.kind === "working" ? "Exporting..." :
-                         exportState.kind === "success" ? "Export complete" : "Export failed"}
-                      </strong>
-                      <p>{exportState.message || "Select options and click Export Markdown or Export HTML to begin."}</p>
-                    </div>
-                    {exportState.outputPath && (
-                      <div className="filter-actions">
-                        <button className="ghost-button" onClick={() => void revealPath(exportState.outputPath)}>
-                          Reveal
-                        </button>
-                        <button className="ghost-button" onClick={() => void openPath(exportState.outputPath)}>
-                          Open
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
                 {error && <div className="inline-error" style={{ marginTop: "1rem" }}>{error}</div>}
               </div>
             ) : (
@@ -826,6 +973,30 @@ function App() {
           </section>
         </section>
       </main>
+      {exportDialog && (
+        <ExportDialog
+          format={exportDialog.format}
+          includeImages={exportImages}
+          includeToolCallResults={exportToolCallResults}
+          inlineImages={exportInlineImages}
+          isWorking={exportState.kind === "working"}
+          onClose={() => setExportDialog(null)}
+          onConfirm={() => void submitExportDialog()}
+          onIncludeImagesChange={setExportImages}
+          onIncludeToolCallResultsChange={setExportToolCallResults}
+          onInlineImagesChange={setExportInlineImages}
+        />
+      )}
+      {exportState.kind === "working" && (
+        <ExportProgressDialog
+          cancelPending={exportCancelPending}
+          message={exportState.message}
+          onCancel={() => void cancelActiveExport()}
+          progressPercent={exportState.progressPercent}
+          sessionTitle={activeSession ? getSessionTitle(activeSession) : "Selected session"}
+          stage={exportState.stage}
+        />
+      )}
     </div>
   );
 }
@@ -835,6 +1006,180 @@ function MetaItem({ label, value }: { label: string; value: string }) {
     <div className="meta-item">
       <span className="meta-label">{label}</span>
       <span className="meta-value">{value}</span>
+    </div>
+  );
+}
+
+function ExportDialog(props: {
+  format: ExportFormat;
+  includeImages: boolean;
+  includeToolCallResults: boolean;
+  inlineImages: boolean;
+  isWorking: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+  onIncludeImagesChange: (value: boolean) => void;
+  onIncludeToolCallResultsChange: (value: boolean) => void;
+  onInlineImagesChange: (value: boolean) => void;
+}) {
+  const label = formatExportLabel(props.format);
+  const htmlUsesFilePicker = htmlExportUsesFilePicker(
+    props.includeImages,
+    props.inlineImages,
+  );
+
+  return (
+    <div className="dialog-backdrop" onClick={props.onClose}>
+      <div
+        aria-modal="true"
+        className="export-dialog"
+        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="export-dialog-header">
+          <div>
+            <span className="dialog-kicker">{label} export</span>
+            <h3>Export Options</h3>
+            <p>Pick what to include before choosing where this export should go.</p>
+          </div>
+          <button
+            aria-label="Close export dialog"
+            className="dialog-close"
+            onClick={props.onClose}
+            type="button"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="export-dialog-options">
+          <label className="dialog-option">
+            <input
+              checked={props.includeImages}
+              onChange={(event) => props.onIncludeImagesChange(event.target.checked)}
+              type="checkbox"
+            />
+            <span className="dialog-option-copy">
+              <strong>Include captured images</strong>
+              <small>Render image attachments from the session into the export.</small>
+            </span>
+          </label>
+
+          {props.format === "html" && (
+            <label className={`dialog-option ${!props.includeImages ? "dialog-option-disabled" : ""}`}>
+              <input
+                checked={props.inlineImages}
+                disabled={!props.includeImages}
+                onChange={(event) => props.onInlineImagesChange(event.target.checked)}
+                type="checkbox"
+              />
+              <span className="dialog-option-copy">
+                <strong>Inline images (HTML)</strong>
+                <small>
+                  {props.includeImages
+                    ? "Keep image data embedded in the HTML source and skip the extra asset folder."
+                    : "Enable captured images first to choose whether HTML embeds them or writes sidecar files."}
+                </small>
+              </span>
+            </label>
+          )}
+
+          <label className="dialog-option">
+            <input
+              checked={props.includeToolCallResults}
+              onChange={(event) =>
+                props.onIncludeToolCallResultsChange(event.target.checked)
+              }
+              type="checkbox"
+            />
+            <span className="dialog-option-copy">
+              <strong>Include tool calls and results</strong>
+              <small>Append tool invocations and outputs to the exported transcript.</small>
+            </span>
+          </label>
+        </div>
+
+        <div className="dialog-destination">
+          <span className="dialog-destination-label">Destination</span>
+          <strong>
+            {props.format === "markdown"
+              ? "Choose a folder"
+              : htmlUsesFilePicker
+                ? "Save as .html file"
+                : "Choose a folder"}
+          </strong>
+          <p>
+            {getExportDestinationHint(
+              props.format,
+              props.includeImages,
+              props.inlineImages,
+            )}
+          </p>
+        </div>
+
+        <div className="dialog-actions">
+          <button className="ghost-button" onClick={props.onClose} type="button">
+            Cancel
+          </button>
+          <button
+            className="primary-button"
+            disabled={props.isWorking}
+            onClick={props.onConfirm}
+            type="button"
+          >
+            Export {label}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExportProgressDialog(props: {
+  cancelPending: boolean;
+  message: string;
+  onCancel: () => void;
+  progressPercent: number;
+  sessionTitle: string;
+  stage: string;
+}) {
+  const clampedProgress = Math.max(4, Math.min(100, props.progressPercent));
+
+  return (
+    <div className="dialog-backdrop">
+      <div aria-modal="true" className="export-progress-dialog" role="dialog">
+        <div className="export-progress-header">
+          <div>
+            <span className="dialog-kicker">Export in progress</span>
+            <h3>{props.sessionTitle}</h3>
+            <p>{props.message}</p>
+          </div>
+          <span className="export-progress-percent">{Math.round(clampedProgress)}%</span>
+        </div>
+
+        <div className="export-progress-track" aria-hidden="true">
+          <div
+            className="export-progress-fill"
+            style={{ width: `${clampedProgress}%` }}
+          />
+        </div>
+
+        <div className="export-progress-meta">
+          <span>{props.stage}</span>
+          <span>{props.cancelPending ? "Stopping export..." : "Processing large session files can take a few seconds."}</span>
+        </div>
+
+        <div className="dialog-actions">
+          <button
+            className="ghost-button"
+            disabled={props.cancelPending}
+            onClick={props.onCancel}
+            type="button"
+          >
+            {props.cancelPending ? "Cancelling..." : "Cancel Export"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

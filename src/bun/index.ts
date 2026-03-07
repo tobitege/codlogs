@@ -1,7 +1,9 @@
+import * as childProcess from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { BrowserView, BrowserWindow, Updater, Utils } from "electrobun/bun";
 import {
+  type ExportProgress,
   exportSessionJsonlToMarkdown,
   exportSessionJsonlToHtml,
   findCodexSessions,
@@ -51,6 +53,13 @@ function getStartingFolder(candidate: string | null): string {
   return trimmed || getAppWorkingDirectory();
 }
 
+function getSuggestedExportFileName(
+  sessionFilePath: string,
+  extension: "html" | "md",
+): string {
+  return `${path.parse(sessionFilePath).name}.${extension}`;
+}
+
 type AppSettings = {
   exportDirectory?: string | null;
   lastOpenedFolder?: string | null;
@@ -63,13 +72,20 @@ type AppSettings = {
 };
 
 type ExportJobStatus = {
-  kind: "working" | "success" | "error";
+  kind: "working" | "success" | "error" | "cancelled";
+  progressPercent: number;
+  stage: string;
   message: string;
   outputPath: string | null;
 };
 
+type ExportJobRecord = {
+  controller: AbortController;
+  status: ExportJobStatus;
+};
+
 const EXPORT_JOB_RETENTION_MS = 5 * 60 * 1000;
-const exportJobs = new Map<string, ExportJobStatus>();
+const exportJobs = new Map<string, ExportJobRecord>();
 const DEFAULT_WINDOW_FRAME = {
   width: 1600,
   height: 1000,
@@ -93,34 +109,97 @@ function scheduleExportJobCleanup(jobId: string): void {
 function getMissingExportJobStatus(): ExportJobStatus {
   return {
     kind: "error",
+    progressPercent: 0,
+    stage: "missing",
     message: "The export job is no longer available.",
     outputPath: null,
   };
 }
 
-function startHtmlExportJob(options: {
+function getExportJobStatus(jobId: string): ExportJobStatus {
+  return exportJobs.get(jobId)?.status ?? getMissingExportJobStatus();
+}
+
+function setExportJobStatus(jobId: string, status: ExportJobStatus): void {
+  const existing = exportJobs.get(jobId);
+  if (!existing) {
+    return;
+  }
+
+  existing.status = status;
+}
+
+function updateExportJobProgress(jobId: string, progress: ExportProgress): void {
+  setExportJobStatus(jobId, {
+    kind: "working",
+    progressPercent: progress.progressPercent,
+    stage: progress.stage,
+    message: progress.message,
+    outputPath: null,
+  });
+}
+
+function wasExportCancelled(error: unknown): boolean {
+  return error instanceof Error && error.name === "ExportCancelledError";
+}
+
+function startExportJob(options: {
+  format: "markdown" | "html";
   sessionFilePath: string;
   includeImages: boolean;
+  inlineImages: boolean;
   includeToolCallResults: boolean;
   outputDirectory: string | null;
+  outputPath: string | null;
 }): { jobId: string } {
   const jobId = crypto.randomUUID();
+  const controller = new AbortController();
   exportJobs.set(jobId, {
-    kind: "working",
-    message: "Creating HTML export...",
-    outputPath: null,
+    controller,
+    status: {
+      kind: "working",
+      progressPercent: 2,
+      stage: "reading",
+      message: `Preparing ${options.format === "markdown" ? "Markdown" : "HTML"} export...`,
+      outputPath: null,
+    },
   });
 
   void (async () => {
     try {
-      const outputPath = await exportSessionJsonlToHtml(options.sessionFilePath, {
-        includeImages: options.includeImages,
-        includeToolCallResults: options.includeToolCallResults,
-        outputDirectory: options.outputDirectory,
-      });
-      exportJobs.set(jobId, {
+      const outputPath =
+        options.format === "markdown"
+          ? await exportSessionJsonlToMarkdown(
+              options.sessionFilePath,
+              {
+                includeImages: options.includeImages,
+                includeToolCallResults: options.includeToolCallResults,
+                outputDirectory: options.outputDirectory,
+              },
+              {
+                signal: controller.signal,
+                onProgress: (progress) => updateExportJobProgress(jobId, progress),
+              },
+            )
+          : await exportSessionJsonlToHtml(
+              options.sessionFilePath,
+              {
+                includeImages: options.includeImages,
+                inlineImages: options.inlineImages,
+                includeToolCallResults: options.includeToolCallResults,
+                outputDirectory: options.outputDirectory,
+                outputPath: options.outputPath,
+              },
+              {
+                signal: controller.signal,
+                onProgress: (progress) => updateExportJobProgress(jobId, progress),
+              },
+            );
+      setExportJobStatus(jobId, {
         kind: "success",
-        message: `HTML written to ${outputPath}`,
+        progressPercent: 100,
+        stage: "done",
+        message: `${options.format === "markdown" ? "Markdown" : "HTML"} written to ${outputPath}`,
         outputPath,
       });
       Utils.showNotification({
@@ -128,21 +207,47 @@ function startHtmlExportJob(options: {
         body: path.basename(outputPath),
       });
     } catch (error) {
-      exportJobs.set(jobId, {
-        kind: "error",
-        message: asErrorMessage(error),
-        outputPath: null,
-      });
-      Utils.showNotification({
-        title: "codlogs export failed",
-        body: path.basename(options.sessionFilePath),
-      });
+      if (wasExportCancelled(error)) {
+        setExportJobStatus(jobId, {
+          kind: "cancelled",
+          progressPercent: getExportJobStatus(jobId).progressPercent,
+          stage: "cancelled",
+          message: "Export cancelled.",
+          outputPath: null,
+        });
+      } else {
+        setExportJobStatus(jobId, {
+          kind: "error",
+          progressPercent: getExportJobStatus(jobId).progressPercent,
+          stage: "error",
+          message: asErrorMessage(error),
+          outputPath: null,
+        });
+        Utils.showNotification({
+          title: "codlogs export failed",
+          body: path.basename(options.sessionFilePath),
+        });
+      }
     } finally {
       scheduleExportJobCleanup(jobId);
     }
   })();
 
   return { jobId };
+}
+
+function cancelExportJob(jobId: string): { ok: boolean } {
+  const existing = exportJobs.get(jobId);
+  if (!existing || existing.status.kind !== "working") {
+    return { ok: false };
+  }
+
+  existing.controller.abort();
+  existing.status = {
+    ...existing.status,
+    message: "Cancelling export...",
+  };
+  return { ok: true };
 }
 
 async function getSettingsFilePath(): Promise<string> {
@@ -198,6 +303,138 @@ async function rememberExportDirectory(exportDirectory: string): Promise<void> {
   await updateAppSettings((settings) => {
     settings.exportDirectory = exportDirectory;
   });
+}
+
+function htmlExportNeedsAssetDirectory(options: {
+  includeImages: boolean;
+  inlineImages: boolean;
+}): boolean {
+  return options.includeImages && !options.inlineImages;
+}
+
+function runDialogProcess(
+  file: string,
+  args: string[],
+): childProcess.SpawnSyncReturns<string> {
+  return childProcess.spawnSync(file, args, {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
+
+function escapeAppleScriptString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function escapePowerShellString(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+function pickSaveFilePathOnWindows(options: {
+  startingFolder: string;
+  suggestedFileName: string;
+}): string | null {
+  const script = `
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+$dialog = New-Object System.Windows.Forms.SaveFileDialog
+$dialog.InitialDirectory = '${escapePowerShellString(options.startingFolder)}'
+$dialog.FileName = '${escapePowerShellString(options.suggestedFileName)}'
+$dialog.Filter = 'HTML files (*.html)|*.html|All files (*.*)|*.*'
+$dialog.DefaultExt = 'html'
+$dialog.AddExtension = $true
+$dialog.OverwritePrompt = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+  Write-Output $dialog.FileName
+}
+`.trim();
+  const result = runDialogProcess("powershell", ["-NoProfile", "-STA", "-Command", script]);
+  if (result.error || result.status !== 0) {
+    throw new Error(result.error?.message ?? "Could not open the Windows save dialog.");
+  }
+
+  return normalizeDialogResult(`${result.stdout ?? ""}`);
+}
+
+function pickSaveFilePathOnDarwin(options: {
+  startingFolder: string;
+  suggestedFileName: string;
+}): string | null {
+  const args = [
+    "-e",
+    `set defaultLocation to POSIX file "${escapeAppleScriptString(options.startingFolder)}"`,
+    "-e",
+    `set pickedFile to choose file name with prompt "Save HTML export as" default location defaultLocation default name "${escapeAppleScriptString(options.suggestedFileName)}"`,
+    "-e",
+    "POSIX path of pickedFile",
+  ];
+  const result = runDialogProcess("osascript", args);
+  if (result.status === 1 && `${result.stderr ?? ""}`.includes("-128")) {
+    return null;
+  }
+  if (result.error || result.status !== 0) {
+    throw new Error(result.error?.message ?? "Could not open the macOS save dialog.");
+  }
+
+  return normalizeDialogResult(`${result.stdout ?? ""}`);
+}
+
+function pickSaveFilePathOnLinux(options: {
+  startingFolder: string;
+  suggestedFileName: string;
+}): string | null {
+  const defaultPath = path.join(options.startingFolder, options.suggestedFileName);
+  const zenityResult = runDialogProcess("zenity", [
+    "--file-selection",
+    "--save",
+    "--confirm-overwrite",
+    "--filename",
+    defaultPath,
+    "--file-filter=*.html",
+  ]);
+  if (!zenityResult.error && zenityResult.status === 0) {
+    return normalizeDialogResult(`${zenityResult.stdout ?? ""}`);
+  }
+  if (!zenityResult.error && zenityResult.status === 1) {
+    return null;
+  }
+
+  const kdialogResult = runDialogProcess("kdialog", [
+    "--getsavefilename",
+    defaultPath,
+    "*.html | HTML files",
+  ]);
+  if (!kdialogResult.error && kdialogResult.status === 0) {
+    return normalizeDialogResult(`${kdialogResult.stdout ?? ""}`);
+  }
+  if (!kdialogResult.error && kdialogResult.status === 1) {
+    return null;
+  }
+
+  throw new Error(
+    "Could not open a Linux save dialog. Install zenity or kdialog, or export with sidecar assets.",
+  );
+}
+
+async function pickSaveFilePath(options: {
+  sessionFilePath: string;
+  startingFolder: string;
+}): Promise<string | null> {
+  const dialogOptions = {
+    startingFolder: options.startingFolder,
+    suggestedFileName: getSuggestedExportFileName(options.sessionFilePath, "html"),
+  };
+
+  switch (process.platform) {
+    case "win32":
+      return pickSaveFilePathOnWindows(dialogOptions);
+    case "darwin":
+      return pickSaveFilePathOnDarwin(dialogOptions);
+    case "linux":
+      return pickSaveFilePathOnLinux(dialogOptions);
+    default:
+      throw new Error(`Save dialogs are not supported on ${process.platform}.`);
+  }
 }
 
 async function getRememberedOpenedFolder(): Promise<string | null> {
@@ -365,8 +602,66 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
           path: selectedPath,
         };
       },
+      pickHtmlExportDestination: async ({
+        sessionFilePath,
+        includeImages,
+        inlineImages,
+      }) => {
+        const rememberedDirectory = await getRememberedExportDirectory();
+        const startingFolder =
+          rememberedDirectory ?? path.dirname(sessionFilePath) ?? getAppWorkingDirectory();
+        const selectionKind = htmlExportNeedsAssetDirectory({
+          includeImages,
+          inlineImages,
+        })
+          ? "directory"
+          : "file";
+
+        const selectedPath =
+          selectionKind === "directory"
+            ? normalizeDialogResult(
+                (
+                  await Utils.openFileDialog({
+                    startingFolder,
+                    canChooseFiles: false,
+                    canChooseDirectory: true,
+                    allowsMultipleSelection: false,
+                  })
+                )[0],
+              )
+            : await pickSaveFilePath({
+                sessionFilePath,
+                startingFolder,
+              });
+
+        if (selectedPath) {
+          await rememberExportDirectory(
+            selectionKind === "directory" ? selectedPath : path.dirname(selectedPath),
+          );
+        }
+
+        return {
+          path: selectedPath,
+          selectionKind,
+        };
+      },
       getSessionDetailMetrics: async ({ sessionFilePath }) =>
         getSessionDetailMetrics(sessionFilePath),
+      startSessionMarkdownExport: async ({
+        sessionFilePath,
+        includeImages,
+        includeToolCallResults,
+        outputDirectory,
+      }) =>
+        startExportJob({
+          format: "markdown",
+          sessionFilePath,
+          includeImages,
+          inlineImages: false,
+          includeToolCallResults,
+          outputDirectory,
+          outputPath: null,
+        }),
       exportSessionMarkdown: async ({
         sessionFilePath,
         includeImages,
@@ -387,17 +682,22 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
       startSessionHtmlExport: async ({
         sessionFilePath,
         includeImages,
+        inlineImages,
         includeToolCallResults,
         outputDirectory,
+        outputPath,
       }) =>
-        startHtmlExportJob({
+        startExportJob({
+          format: "html",
           sessionFilePath,
           includeImages,
+          inlineImages,
           includeToolCallResults,
           outputDirectory,
+          outputPath,
         }),
-      getExportJobStatus: async ({ jobId }) =>
-        exportJobs.get(jobId) ?? getMissingExportJobStatus(),
+      getExportJobStatus: async ({ jobId }) => getExportJobStatus(jobId),
+      cancelExportJob: async ({ jobId }) => cancelExportJob(jobId),
       revealPath: ({ path: targetPath }) => {
         Utils.showItemInFolder(targetPath);
         return { ok: true };

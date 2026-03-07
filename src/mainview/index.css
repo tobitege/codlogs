@@ -317,6 +317,14 @@ code,
   transform: translateY(-1px);
 }
 
+.primary-button:disabled,
+.ghost-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+  box-shadow: none;
+}
+
 .primary-button:active {
   transform: translateY(0);
 }
@@ -558,27 +566,6 @@ code,
   word-break: break-all;
 }
 
-.export-section {
-  background: white;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  padding: 1.25rem;
-  box-shadow: var(--shadow-sm);
-}
-
-.export-section h3 {
-  margin: 0 0 1rem;
-  font-family: var(--font-serif);
-  font-size: 1.25rem;
-}
-
-.export-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  margin-bottom: 1.25rem;
-}
-
 .checkbox-label {
   display: flex;
   align-items: center;
@@ -608,6 +595,10 @@ code,
   border: 1px solid var(--color-border);
 }
 
+.export-status-inline {
+  margin-top: -0.35rem;
+}
+
 .status-info strong {
   display: block;
   font-size: 0.8rem;
@@ -624,7 +615,243 @@ code,
 .status-idle { border-left: 4px solid #dee2e6; }
 .status-working { border-left: 4px solid var(--color-secondary); }
 .status-success { border-left: 4px solid #28a745; background: #f4fff6; }
+.status-cancelled { border-left: 4px solid #9aa4af; background: #f7f8fa; }
 .status-error { border-left: 4px solid #dc3545; background: #fff5f5; }
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: rgba(33, 28, 21, 0.34);
+  backdrop-filter: blur(10px);
+  z-index: 20;
+}
+
+.export-dialog {
+  width: min(100%, 720px);
+  background:
+    linear-gradient(180deg, rgba(255, 250, 243, 0.98), rgba(249, 243, 234, 0.96)),
+    white;
+  border: 1px solid rgba(99, 82, 58, 0.18);
+  border-radius: 1.5rem;
+  box-shadow: 0 24px 64px rgba(44, 33, 19, 0.2);
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  animation: fade-up 0.22s ease-out;
+}
+
+.export-progress-dialog {
+  width: min(100%, 640px);
+  background:
+    linear-gradient(180deg, rgba(255, 250, 243, 0.98), rgba(249, 243, 234, 0.96)),
+    white;
+  border: 1px solid rgba(99, 82, 58, 0.18);
+  border-radius: 1.5rem;
+  box-shadow: 0 24px 64px rgba(44, 33, 19, 0.2);
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  animation: fade-up 0.22s ease-out;
+}
+
+.export-dialog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.export-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.dialog-kicker {
+  display: inline-block;
+  margin-bottom: 0.45rem;
+  color: var(--color-accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.export-dialog-header h3 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 2rem;
+  letter-spacing: -0.03em;
+}
+
+.export-dialog-header p {
+  margin: 0.45rem 0 0;
+  max-width: 38rem;
+  color: var(--color-text-muted);
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.export-progress-header h3 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 1.6rem;
+  line-height: 1.15;
+  letter-spacing: -0.03em;
+}
+
+.export-progress-header p {
+  margin: 0.45rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.export-progress-percent {
+  min-width: 4.5rem;
+  text-align: right;
+  color: var(--color-secondary);
+  font-size: 1.4rem;
+  font-weight: 700;
+}
+
+.export-progress-track {
+  overflow: hidden;
+  height: 0.9rem;
+  border-radius: 999px;
+  background: rgba(53, 123, 132, 0.12);
+  border: 1px solid rgba(53, 123, 132, 0.12);
+}
+
+.export-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background:
+    linear-gradient(90deg, rgba(53, 123, 132, 0.95), rgba(176, 82, 47, 0.92));
+  box-shadow: 0 6px 18px rgba(53, 123, 132, 0.24);
+  transition: width 0.25s ease;
+}
+
+.export-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  color: var(--color-text-muted);
+  font-size: 0.83rem;
+  text-transform: capitalize;
+}
+
+.dialog-close {
+  height: auto;
+  padding: 0.6rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: rgba(255, 255, 255, 0.64);
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.dialog-close:hover {
+  background: white;
+  color: var(--color-text);
+}
+
+.export-dialog-options {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.dialog-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.9rem;
+  padding: 1rem 1.05rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(99, 82, 58, 0.14);
+  background: rgba(255, 255, 255, 0.72);
+  cursor: pointer;
+  transition: border-color 0.2s ease, transform 0.12s ease, background 0.2s ease;
+}
+
+.dialog-option:hover {
+  border-color: rgba(53, 123, 132, 0.34);
+  transform: translateY(-1px);
+}
+
+.dialog-option input {
+  width: 1.1rem;
+  height: 1.1rem;
+  margin-top: 0.15rem;
+  accent-color: var(--color-accent);
+}
+
+.dialog-option-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.dialog-option-copy strong {
+  font-size: 0.98rem;
+}
+
+.dialog-option-copy small {
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.dialog-option-disabled {
+  opacity: 0.68;
+}
+
+.dialog-option-disabled:hover {
+  transform: none;
+}
+
+.dialog-destination {
+  padding: 1rem 1.1rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(53, 123, 132, 0.16);
+  background:
+    radial-gradient(circle at top right, rgba(53, 123, 132, 0.1), transparent 36%),
+    rgba(241, 248, 248, 0.85);
+}
+
+.dialog-destination-label {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--color-secondary);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.dialog-destination strong {
+  display: block;
+  font-size: 1rem;
+}
+
+.dialog-destination p {
+  margin: 0.4rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
 
 .empty-state {
   flex: 1;
@@ -687,5 +914,28 @@ code,
   }
   .hero-copy {
     max-width: none;
+  }
+  .export-dialog {
+    padding: 1.2rem;
+  }
+  .export-progress-dialog {
+    padding: 1.2rem;
+  }
+  .export-dialog-header,
+  .export-progress-header,
+  .dialog-actions,
+  .status-banner {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .export-progress-percent {
+    text-align: left;
+  }
+  .export-progress-meta {
+    flex-direction: column;
+  }
+  .dialog-actions button,
+  .status-banner .filter-actions {
+    width: 100%;
   }
 }
