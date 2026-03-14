@@ -5,6 +5,7 @@
   "description": "Codex session CLI and Electrobun browser.",
   "license": "UNLICENSED",
   "type": "module",
+  "packageManager": "bun@1.3.9",
   "bin": {
     "codlogs": "./codlogs.cjs",
     "codlogs-sessions": "./codlogs-sessions.cjs"

@@ -17,6 +17,11 @@
 - a global CLI for finding sessions and exporting one `.jsonl` session to Markdown or HTML
 - an Electrobun desktop browser for scanning sessions, filtering by folder, and exporting the selected session to `.md` or `.html`
 
+Planning and investigation artifacts for this repo live under `devlog/YYYY-MM-DD/`.
+
+This repository uses Bun as its development package manager and commits `bun.lock`.
+If you are working in this repo, use `bun install` instead of `npm install` or `pnpm install`.
+
 ## CLI
 
 Install it globally from this folder:

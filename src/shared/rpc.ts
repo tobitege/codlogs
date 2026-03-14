@@ -54,6 +54,7 @@ export type CodexerRPC = {
       getSessionDetailMetrics: {
         params: {
           sessionFilePath: string;
+          forceDeepAnalysis: boolean;
         };
         response: SessionDetailMetrics;
       };

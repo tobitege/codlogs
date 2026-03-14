@@ -214,18 +214,36 @@ function printHumanReadable(payload: FindCodexSessionsResult, commandName: strin
   }
 
   for (const session of payload.sessions) {
+    const largeMarker = session.fileSizeBytes >= 64 * 1024 * 1024 ? "  [large]" : "";
     console.log("");
     console.log(
-      `${session.updatedAt ?? session.startedAt ?? "unknown-time"}  ${padRight(session.kind, 8)}  ${session.threadName ?? "(untitled session)"}`,
+      `${session.updatedAt ?? session.startedAt ?? "unknown-time"}  ${padRight(session.kind, 8)}  ${session.threadName ?? "(untitled session)"}${largeMarker}`,
     );
     console.log(`  cwd : ${session.cwd}`);
     console.log(`  id  : ${session.id}`);
+    console.log(`  size: ${formatFileSize(session.fileSizeBytes)}`);
     console.log(`  file: ${session.file}`);
   }
 }
 
 function padRight(value: string, length: number): string {
   return value.length >= length ? value : `${value}${" ".repeat(length - value.length)}`;
+}
+
+function formatFileSize(value: number): string {
+  if (value < 1024) {
+    return `${value} B`;
+  }
+
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value;
+  let unitIndex = -1;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${size >= 100 ? size.toFixed(0) : size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unitIndex]}`;
 }
 
 function getCommandName(): string {

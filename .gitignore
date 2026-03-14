@@ -29,6 +29,8 @@ bun-debug.log*
 # Editors and OS noise
 .idea/
 .vscode/
+!.vscode/
+!.vscode/settings.json
 .DS_Store
 Thumbs.db
 Desktop.ini

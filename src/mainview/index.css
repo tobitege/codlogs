@@ -468,6 +468,13 @@ code,
   margin-bottom: 0.75rem;
 }
 
+.session-card-badges {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
 .kind-badge {
   font-size: 0.7rem;
   font-weight: 700;
@@ -485,6 +492,20 @@ code,
 .kind-archived {
   background: rgba(133, 85, 54, 0.12);
   color: #855536;
+}
+
+.size-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 0.22rem 0.55rem;
+  border-radius: 999px;
+  color: #8a4a27;
+  background: rgba(176, 82, 47, 0.12);
+}
+
+.session-card-large {
+  border-color: rgba(176, 82, 47, 0.22);
 }
 
 .session-time {
@@ -599,6 +620,10 @@ code,
   margin-top: -0.35rem;
 }
 
+.analysis-banner {
+  margin-top: -0.35rem;
+}
+
 .status-info strong {
   display: block;
   font-size: 0.8rem;
@@ -617,6 +642,8 @@ code,
 .status-success { border-left: 4px solid #28a745; background: #f4fff6; }
 .status-cancelled { border-left: 4px solid #9aa4af; background: #f7f8fa; }
 .status-error { border-left: 4px solid #dc3545; background: #fff5f5; }
+.status-warning { border-left: 4px solid #d97706; background: #fff8eb; }
+.status-notice { border-left: 4px solid var(--color-secondary); background: #f2fbfb; }
 
 .dialog-backdrop {
   position: fixed;
@@ -767,6 +794,25 @@ code,
 .export-dialog-options {
   display: grid;
   gap: 0.9rem;
+}
+
+.dialog-warning {
+  padding: 1rem 1.05rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(176, 82, 47, 0.2);
+  background: rgba(255, 247, 239, 0.92);
+}
+
+.dialog-warning strong {
+  display: block;
+  font-size: 0.92rem;
+}
+
+.dialog-warning p {
+  margin: 0.35rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
 }
 
 .dialog-option {

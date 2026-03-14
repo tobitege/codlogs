@@ -32,9 +32,8 @@ type ExportDialogState = {
 
 type SessionDetailMetricsState = {
   kind: "idle" | "loading" | "ready" | "error";
-  interactionCount: number | null;
-  toolCallCount: number | null;
-  fileSizeBytes: number | null;
+  metrics: SessionDetailMetrics | null;
+  errorMessage: string | null;
 };
 
 const timestampFormatter = new Intl.DateTimeFormat(undefined, {
@@ -42,6 +41,7 @@ const timestampFormatter = new Intl.DateTimeFormat(undefined, {
   timeStyle: "short",
 });
 
+const LARGE_SESSION_WARNING_BYTES = 64 * 1024 * 1024;
 const RPC_MAX_REQUEST_TIME_MS = 15 * 60 * 1000;
 const REPOSITORY_URL = "https://github.com/tobitege/codlogs";
 
@@ -138,16 +138,27 @@ function formatFileSize(value: number | null): string {
 }
 
 function formatInteractionSummary(
-  interactionCount: number | null,
-  toolCallCount: number | null,
+  metricsState: SessionDetailMetricsState,
 ): string {
-  if (interactionCount === null || toolCallCount === null) {
+  if (metricsState.kind === "error") {
+    return "Unavailable";
+  }
+
+  if (metricsState.kind === "loading" || metricsState.kind === "idle") {
     return "Loading...";
+  }
+
+  const interactionCount = metricsState.metrics?.interactionCount ?? null;
+  const toolCallCount = metricsState.metrics?.toolCallCount ?? null;
+  if (interactionCount === null || toolCallCount === null) {
+    return "Unavailable";
   }
 
   const promptLabel = `${interactionCount} ${interactionCount === 1 ? "prompt" : "prompts"}`;
   const toolCallLabel = `${toolCallCount} ${toolCallCount === 1 ? "tool call" : "tool calls"}`;
-  return `${promptLabel} / ${toolCallLabel}`;
+  return metricsState.metrics?.analysisKind === "partial"
+    ? `${promptLabel} / ${toolCallLabel} (partial)`
+    : `${promptLabel} / ${toolCallLabel}`;
 }
 
 function matchesSearch(session: SessionMetaMatch, query: string): boolean {
@@ -168,6 +179,64 @@ function matchesSearch(session: SessionMetaMatch, query: string): boolean {
 
 function asErrorMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
+}
+
+function isLargeSession(session: SessionMetaMatch | null): boolean {
+  return (session?.fileSizeBytes ?? 0) >= LARGE_SESSION_WARNING_BYTES;
+}
+
+function getMetricsFileSize(
+  metricsState: SessionDetailMetricsState,
+  activeSession: SessionMetaMatch | null,
+): number | null {
+  return metricsState.metrics?.fileSizeBytes ?? activeSession?.fileSizeBytes ?? null;
+}
+
+function getAnalysisBannerCopy(
+  metricsState: SessionDetailMetricsState,
+  activeSession: SessionMetaMatch | null,
+): { kind: "warning" | "notice"; title: string; message: string } | null {
+  if (metricsState.kind === "error") {
+    return {
+      kind: "warning",
+      title: "Session analysis unavailable",
+      message: metricsState.errorMessage ?? "Could not inspect this session safely.",
+    };
+  }
+
+  if (metricsState.kind !== "ready" || !metricsState.metrics) {
+    return null;
+  }
+
+  if (metricsState.metrics.analysisKind === "skipped") {
+    return {
+      kind: "warning",
+      title: "Large session analysis skipped",
+      message:
+        metricsState.metrics.skipReason ??
+        `This session is ${formatFileSize(getMetricsFileSize(metricsState, activeSession))}. Deep analysis is opt-in so browsing stays responsive.`,
+    };
+  }
+
+  if (metricsState.metrics.analysisKind === "partial") {
+    return {
+      kind: "notice",
+      title: "Partial analysis",
+      message:
+        metricsState.metrics.skipReason ??
+        "Some oversized JSONL rows were skipped to keep this inspection bounded.",
+    };
+  }
+
+  if (isLargeSession(activeSession)) {
+    return {
+      kind: "notice",
+      title: "Large session",
+      message: `This session is ${formatFileSize(activeSession?.fileSizeBytes ?? null)}. Export is supported, but deep operations may take longer than normal.`,
+    };
+  }
+
+  return null;
 }
 
 function GitHubMark(props: { className?: string }): JSX.Element {
@@ -263,9 +332,8 @@ function App() {
   const [sessionDetailMetricsState, setSessionDetailMetricsState] =
     useState<SessionDetailMetricsState>({
       kind: "idle",
-      interactionCount: null,
-      toolCallCount: null,
-      fileSizeBytes: null,
+      metrics: null,
+      errorMessage: null,
     });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -337,6 +405,8 @@ function App() {
     null;
   const activeSessionDetailMetrics =
     activeSession ? sessionDetailMetricsByFile[activeSession.file] ?? null : null;
+  const activeSessionFileSize = getMetricsFileSize(sessionDetailMetricsState, activeSession);
+  const analysisBanner = getAnalysisBannerCopy(sessionDetailMetricsState, activeSession);
 
   useEffect(() => {
     const hasSelectedSession = filteredSessions.some(
@@ -354,9 +424,8 @@ function App() {
     if (!activeSession) {
       setSessionDetailMetricsState({
         kind: "idle",
-        interactionCount: null,
-        toolCallCount: null,
-        fileSizeBytes: null,
+        metrics: null,
+        errorMessage: null,
       });
       return;
     }
@@ -364,56 +433,59 @@ function App() {
     if (activeSessionDetailMetrics) {
       setSessionDetailMetricsState({
         kind: "ready",
-        interactionCount: activeSessionDetailMetrics.interactionCount,
-        toolCallCount: activeSessionDetailMetrics.toolCallCount,
-        fileSizeBytes: activeSessionDetailMetrics.fileSizeBytes,
+        metrics: activeSessionDetailMetrics,
+        errorMessage: null,
       });
       return;
     }
 
+    void requestSessionDetailMetrics(activeSession.file, false);
+  }, [activeSession, activeSessionDetailMetrics]);
+
+  async function requestSessionDetailMetrics(
+    sessionFilePath: string,
+    forceDeepAnalysis: boolean,
+  ): Promise<void> {
     const requestId = detailRequestIdRef.current + 1;
     detailRequestIdRef.current = requestId;
+
     setSessionDetailMetricsState({
       kind: "loading",
-      interactionCount: null,
-      toolCallCount: null,
-      fileSizeBytes: null,
+      metrics: null,
+      errorMessage: null,
     });
 
-    void (async () => {
-      try {
-        const metrics = await getRpc().request.getSessionDetailMetrics({
-          sessionFilePath: activeSession.file,
-        });
+    try {
+      const metrics = await getRpc().request.getSessionDetailMetrics({
+        sessionFilePath,
+        forceDeepAnalysis,
+      });
 
-        if (requestId !== detailRequestIdRef.current) {
-          return;
-        }
-
-        setSessionDetailMetricsByFile((current) => ({
-          ...current,
-          [activeSession.file]: metrics,
-        }));
-        setSessionDetailMetricsState({
-          kind: "ready",
-          interactionCount: metrics.interactionCount,
-          toolCallCount: metrics.toolCallCount,
-          fileSizeBytes: metrics.fileSizeBytes,
-        });
-      } catch {
-        if (requestId !== detailRequestIdRef.current) {
-          return;
-        }
-
-        setSessionDetailMetricsState({
-          kind: "error",
-          interactionCount: null,
-          toolCallCount: null,
-          fileSizeBytes: null,
-        });
+      if (requestId !== detailRequestIdRef.current) {
+        return;
       }
-    })();
-  }, [activeSession, activeSessionDetailMetrics]);
+
+      setSessionDetailMetricsByFile((current) => ({
+        ...current,
+        [sessionFilePath]: metrics,
+      }));
+      setSessionDetailMetricsState({
+        kind: "ready",
+        metrics,
+        errorMessage: null,
+      });
+    } catch (detailError) {
+      if (requestId !== detailRequestIdRef.current) {
+        return;
+      }
+
+      setSessionDetailMetricsState({
+        kind: "error",
+        metrics: null,
+        errorMessage: asErrorMessage(detailError),
+      });
+    }
+  }
 
   async function loadSessions(
     targetDirectory: string | null,
@@ -718,6 +790,14 @@ function App() {
     );
   }
 
+  function handleAnalyzeLargeSession(): void {
+    if (!activeSession || sessionDetailMetricsState.kind === "loading") {
+      return;
+    }
+
+    void requestSessionDetailMetrics(activeSession.file, true);
+  }
+
   return (
     <div className="app-shell">
       <div className="ambient ambient-a" />
@@ -862,11 +942,16 @@ function App() {
                 filteredSessions.map((session) => (
                   <button
                     key={session.file}
-                    className={`session-card ${session.file === activeSession?.file ? "selected" : ""}`}
+                    className={`session-card ${session.file === activeSession?.file ? "selected" : ""} ${isLargeSession(session) ? "session-card-large" : ""}`}
                     onClick={() => setSelectedFile(session.file)}
                   >
                     <div className="session-card-header">
-                      <span className={`kind-badge kind-${session.kind}`}>{session.kind}</span>
+                      <div className="session-card-badges">
+                        <span className={`kind-badge kind-${session.kind}`}>{session.kind}</span>
+                        {isLargeSession(session) && (
+                          <span className="size-badge">{formatFileSize(session.fileSizeBytes)}</span>
+                        )}
+                      </div>
                       <span className="session-time">{formatTimestamp(session.updatedAt ?? session.startedAt)}</span>
                     </div>
                     <span className="session-title">{getSessionTitle(session)}</span>
@@ -905,6 +990,23 @@ function App() {
                   </div>
                 </div>
 
+                {analysisBanner && (
+                  <div className={`status-banner analysis-banner status-${analysisBanner.kind}`}>
+                    <div className="status-info">
+                      <strong>{analysisBanner.title}</strong>
+                      <p>{analysisBanner.message}</p>
+                    </div>
+                    {sessionDetailMetricsState.kind === "ready" &&
+                      sessionDetailMetricsState.metrics?.analysisKind === "skipped" && (
+                        <div className="filter-actions">
+                          <button className="primary-button" onClick={handleAnalyzeLargeSession}>
+                            Analyze Anyway
+                          </button>
+                        </div>
+                      )}
+                  </div>
+                )}
+
                 {exportState.kind !== "idle" && exportState.kind !== "working" && (
                   <div className={`status-banner export-status-inline status-${exportState.kind}`}>
                     <div className="status-info">
@@ -941,21 +1043,30 @@ function App() {
                   <MetaItem label="Session ID" value={activeSession.id} />
                   <MetaItem
                     label="Interactions"
-                    value={
-                      sessionDetailMetricsState.kind === "error"
-                        ? "Unavailable"
-                        : formatInteractionSummary(
-                            sessionDetailMetricsState.interactionCount,
-                            sessionDetailMetricsState.toolCallCount,
-                          )
-                    }
+                    value={formatInteractionSummary(sessionDetailMetricsState)}
                   />
                   <MetaItem
                     label="File Size"
                     value={
                       sessionDetailMetricsState.kind === "error"
                         ? "Unavailable"
-                        : formatFileSize(sessionDetailMetricsState.fileSizeBytes)
+                        : formatFileSize(activeSessionFileSize)
+                    }
+                  />
+                  <MetaItem
+                    label="Analysis"
+                    value={
+                      sessionDetailMetricsState.kind === "error"
+                        ? "Unavailable"
+                        : sessionDetailMetricsState.kind === "loading"
+                          ? "Inspecting..."
+                          : sessionDetailMetricsState.kind === "idle"
+                            ? "Waiting"
+                            : sessionDetailMetricsState.metrics?.analysisKind === "skipped"
+                              ? "Skipped"
+                              : sessionDetailMetricsState.metrics?.analysisKind === "partial"
+                                ? "Partial"
+                                : "Full"
                     }
                   />
                   <MetaItem label="Working Directory" value={activeSession.cwd} />
@@ -976,6 +1087,7 @@ function App() {
       {exportDialog && (
         <ExportDialog
           format={exportDialog.format}
+          fileSizeBytes={activeSession?.fileSizeBytes ?? null}
           includeImages={exportImages}
           includeToolCallResults={exportToolCallResults}
           inlineImages={exportInlineImages}
@@ -1012,6 +1124,7 @@ function MetaItem({ label, value }: { label: string; value: string }) {
 
 function ExportDialog(props: {
   format: ExportFormat;
+  fileSizeBytes: number | null;
   includeImages: boolean;
   includeToolCallResults: boolean;
   inlineImages: boolean;
@@ -1027,6 +1140,8 @@ function ExportDialog(props: {
     props.includeImages,
     props.inlineImages,
   );
+  const largeSessionWarning =
+    props.fileSizeBytes !== null && props.fileSizeBytes >= LARGE_SESSION_WARNING_BYTES;
 
   return (
     <div className="dialog-backdrop" onClick={props.onClose}>
@@ -1053,6 +1168,16 @@ function ExportDialog(props: {
         </div>
 
         <div className="export-dialog-options">
+          {largeSessionWarning && (
+            <div className="dialog-warning">
+              <strong>Large session export</strong>
+              <p>
+                This session is {formatFileSize(props.fileSizeBytes)}. Export now streams the
+                JSONL instead of loading it all into memory, but the job can still take a while.
+              </p>
+            </div>
+          )}
+
           <label className="dialog-option">
             <input
               checked={props.includeImages}

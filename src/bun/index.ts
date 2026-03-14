@@ -645,8 +645,10 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
           selectionKind,
         };
       },
-      getSessionDetailMetrics: async ({ sessionFilePath }) =>
-        getSessionDetailMetrics(sessionFilePath),
+      getSessionDetailMetrics: async ({ sessionFilePath, forceDeepAnalysis }) =>
+        getSessionDetailMetrics(sessionFilePath, {
+          forceDeepAnalysis,
+        }),
       startSessionMarkdownExport: async ({
         sessionFilePath,
         includeImages,
