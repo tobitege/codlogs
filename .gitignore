@@ -35,3 +35,7 @@ bun-debug.log*
 Thumbs.db
 Desktop.ini
 .history
+
+# Local research artifacts
+devlog/2026-03-16/app-server-schema/
+devlog/2026-03-16/app-server-ts/

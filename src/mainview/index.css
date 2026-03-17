@@ -131,8 +131,8 @@ code,
   margin: 0 auto;
   padding: 1.5rem;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 1.5rem;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  gap: 1.15rem;
   height: 100%;
   min-height: 0;
 }
@@ -249,7 +249,7 @@ code,
 .control-strip-main {
   display: flex;
   align-items: center;
-  gap: 1rem;
+  gap: 0.7rem;
 }
 
 .control-strip-options {
@@ -298,7 +298,19 @@ code,
 
 .filter-actions {
   display: flex;
-  gap: 0.5rem;
+  gap: 0.35rem;
+}
+
+.detail-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.detail-actions .ghost-button,
+.detail-actions .primary-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .primary-button {
@@ -345,10 +357,24 @@ code,
   border-color: var(--color-text-muted);
 }
 
+.icon-button {
+  width: 3rem;
+  min-width: 3rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.button-icon {
+  width: 1.2rem;
+  height: 1.2rem;
+}
+
 .content-grid {
   display: grid;
   grid-template-columns: 380px 1fr;
-  gap: 1.5rem;
+  gap: 1.15rem;
   min-height: 0;
 }
 
@@ -413,17 +439,17 @@ code,
 .session-list {
   flex: 1;
   overflow-y: auto;
-  padding: 1.25rem;
+  padding: 1rem;
   display: flex;
   flex-direction: column;
-  gap: 1rem;
+  gap: 0.8rem;
 }
 
 .session-card {
   background: var(--color-card-bg);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
-  padding: 1.25rem;
+  padding: 1.25rem 1.25rem 1.7rem;
   min-height: 100px;
   text-align: left;
   transition: all 0.2s;
@@ -432,6 +458,7 @@ code,
   display: flex;
   flex-direction: column;
   justify-content: center;
+  cursor: pointer;
 }
 
 .session-card::before {
@@ -459,6 +486,11 @@ code,
 
 .session-card.selected::before {
   background: var(--color-secondary);
+}
+
+.session-card:focus-visible {
+  outline: 2px solid rgba(53, 123, 132, 0.55);
+  outline-offset: 2px;
 }
 
 .session-card-header {
@@ -534,6 +566,35 @@ code,
   line-height: 1.4;
 }
 
+.session-rename-button {
+  position: absolute;
+  right: 0.95rem;
+  bottom: 0.8rem;
+  width: 1.9rem;
+  height: 1.9rem;
+  border-radius: 999px;
+  border: 1px solid rgba(99, 82, 58, 0.18);
+  background: rgba(255, 255, 255, 0.92);
+  color: var(--color-text-muted);
+  font-weight: 700;
+  font-size: 0.92rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+}
+
+.session-rename-button:hover {
+  background: white;
+  border-color: rgba(53, 123, 132, 0.38);
+  color: var(--color-secondary);
+}
+
+.session-rename-button:focus-visible {
+  outline: 2px solid rgba(53, 123, 132, 0.45);
+  outline-offset: 2px;
+}
+
 .detail-content {
   flex: 1;
   overflow-y: auto;
@@ -547,7 +608,7 @@ code,
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  gap: 1rem;
+  gap: 0.75rem;
 }
 
 .detail-title h2 {
@@ -561,7 +622,7 @@ code,
 .detail-meta-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 1rem;
+  gap: 0.8rem;
 }
 
 .meta-item {
@@ -644,6 +705,92 @@ code,
 .status-error { border-left: 4px solid #dc3545; background: #fff5f5; }
 .status-warning { border-left: 4px solid #d97706; background: #fff8eb; }
 .status-notice { border-left: 4px solid var(--color-secondary); background: #f2fbfb; }
+
+.environment-banner {
+  display: grid;
+  gap: 0.6rem;
+  align-items: start;
+  padding: 0.75rem 0.9rem;
+}
+
+.environment-summary-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.environment-status-info {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 0.8rem;
+}
+
+.environment-summary-text {
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}
+
+.environment-path {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.8rem;
+}
+
+.environment-toggle {
+  height: 2.1rem;
+  padding: 0 0.85rem;
+}
+
+.environment-capability-list {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 1rem;
+  align-items: center;
+}
+
+.environment-capability-line {
+  display: flex;
+  justify-content: flex-start;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.environment-capability-label {
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.environment-capability-value {
+  font-size: 0.84rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.environment-capability-value-ok {
+  color: #1b7f3b;
+}
+
+.environment-capability-value-missing {
+  color: #b45309;
+}
+
+.environment-note-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.environment-note {
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
 
 .dialog-backdrop {
   position: fixed;
@@ -793,12 +940,29 @@ code,
 
 .export-dialog-options {
   display: grid;
-  gap: 0.9rem;
+  gap: 0.7rem;
+}
+
+.dialog-field {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.dialog-field-label {
+  font-size: 0.98rem;
+  font-weight: 700;
+}
+
+.dialog-field-hint {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
 }
 
 .dialog-warning {
-  padding: 1rem 1.05rem;
-  border-radius: 1rem;
+  padding: 0.9rem 1rem;
+  border-radius: 0.85rem;
   border: 1px solid rgba(176, 82, 47, 0.2);
   background: rgba(255, 247, 239, 0.92);
 }
@@ -815,12 +979,25 @@ code,
   line-height: 1.45;
 }
 
+.dialog-warning-neutral {
+  border-color: rgba(99, 82, 58, 0.12);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.dialog-warning-neutral strong {
+  color: var(--color-text);
+}
+
+.rename-session-dialog {
+  width: min(100%, 560px);
+}
+
 .dialog-option {
   display: flex;
   align-items: flex-start;
   gap: 0.9rem;
-  padding: 1rem 1.05rem;
-  border-radius: 1rem;
+  padding: 0.85rem 0.95rem;
+  border-radius: 0.85rem;
   border: 1px solid rgba(99, 82, 58, 0.14);
   background: rgba(255, 255, 255, 0.72);
   cursor: pointer;
@@ -832,7 +1009,7 @@ code,
   transform: translateY(-1px);
 }
 
-.dialog-option input {
+.dialog-option input[type="checkbox"] {
   width: 1.1rem;
   height: 1.1rem;
   margin-top: 0.15rem;
@@ -853,6 +1030,23 @@ code,
   color: var(--color-text-muted);
   font-size: 0.84rem;
   line-height: 1.45;
+}
+
+.dialog-text-input {
+  width: 100%;
+  height: 2.6rem;
+  padding: 0 0.95rem;
+  border: 1px solid rgba(99, 82, 58, 0.18);
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--color-text);
+  font-size: 0.95rem;
+}
+
+.dialog-text-input:focus {
+  outline: none;
+  border-color: rgba(53, 123, 132, 0.5);
+  box-shadow: 0 0 0 3px rgba(53, 123, 132, 0.12);
 }
 
 .dialog-option-disabled {
@@ -973,6 +1167,20 @@ code,
   .status-banner {
     flex-direction: column;
     align-items: stretch;
+  }
+  .environment-summary-row,
+  .environment-capability-line {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .environment-status-info {
+    display: grid;
+    gap: 0.35rem;
+  }
+  .environment-capability-list {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.45rem;
   }
   .export-progress-percent {
     text-align: left;

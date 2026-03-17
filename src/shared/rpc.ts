@@ -1,6 +1,17 @@
 import type { RPCSchema } from "electrobun/view";
 import type { FindCodexSessionsResult, SessionDetailMetrics } from "./codlogs-core.ts";
 
+export type EnvironmentCapabilities = {
+  codexHome: string;
+  codexHomeReadable: boolean;
+  codexHomeWritable: boolean;
+  gitAvailable: boolean;
+  ripgrepAvailable: boolean;
+  overallKind: "success" | "warning" | "error";
+  summary: string;
+  notes: string[];
+};
+
 export type CodexerRPC = {
   bun: RPCSchema<{
     requests: {
@@ -58,6 +69,22 @@ export type CodexerRPC = {
         };
         response: SessionDetailMetrics;
       };
+      getEnvironmentCapabilities: {
+        params: {
+          codexHome: string | null;
+        };
+        response: EnvironmentCapabilities;
+      };
+      renameSessionThreadName: {
+        params: {
+          codexHome: string | null;
+          threadId: string;
+          threadName: string;
+        };
+        response: {
+          threadName: string;
+        };
+      };
       exportSessionMarkdown: {
         params: {
           sessionFilePath: string;
@@ -82,6 +109,20 @@ export type CodexerRPC = {
           jobId: string;
         };
       };
+      startSessionSanitizedCopy: {
+        params: {
+          sessionFilePath: string;
+          codexHome: string | null;
+          chatName: string | null;
+          stripImageContent: boolean;
+          stripBlobContent: boolean;
+          createJsonlCopy: boolean;
+          reAddToCurrentDay: boolean;
+        };
+        response: {
+          jobId: string;
+        };
+      };
       getExportJobStatus: {
         params: {
           jobId: string;
@@ -94,7 +135,27 @@ export type CodexerRPC = {
           outputPath: string | null;
         };
       };
+      getSanitizedCopyJobStatus: {
+        params: {
+          jobId: string;
+        };
+        response: {
+          kind: "working" | "success" | "error" | "cancelled";
+          progressPercent: number;
+          stage: string;
+          message: string;
+          outputPath: string | null;
+        };
+      };
       cancelExportJob: {
+        params: {
+          jobId: string;
+        };
+        response: {
+          ok: boolean;
+        };
+      };
+      cancelSanitizedCopyJob: {
         params: {
           jobId: string;
         };

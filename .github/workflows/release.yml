@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (for example 1.0.0)'
+        description: 'Version to release (for example 1.1.0)'
         required: true
         type: string
       skip_tag:
@@ -52,7 +52,7 @@ jobs:
           TAG="v$VERSION"
 
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid version format. Use semantic versioning such as 1.0.0."
+            echo "::error::Invalid version format. Use semantic versioning such as 1.1.0."
             exit 1
           fi
 

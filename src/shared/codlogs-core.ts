@@ -23,6 +23,7 @@ export type SessionMetaMatch = {
   startedAt: string | null;
   updatedAt: string | null;
   threadName: string | null;
+  source: string | null;
 };
 
 export type FindCodexSessionsOptions = {
@@ -175,7 +176,7 @@ type ExportLoopProgressOptions = {
 type SessionFileProbe = {
   fileSizeBytes: number;
   firstLine: string | null;
-  meta: { id: string; cwd: string; startedAt: string | null } | null;
+  meta: { id: string; cwd: string; startedAt: string | null; source: string | null } | null;
 };
 
 type JsonlLineEvent =
@@ -313,7 +314,7 @@ async function probeSessionFile(filePath: string): Promise<SessionFileProbe | nu
 
 function parseSessionMetaLine(
   firstLine: string | null,
-): { id: string; cwd: string; startedAt: string | null } | null {
+): { id: string; cwd: string; startedAt: string | null; source: string | null } | null {
   if (!firstLine) {
     return null;
   }
@@ -347,6 +348,7 @@ function parseSessionMetaLine(
         : typeof parsed.timestamp === "string"
           ? parsed.timestamp
           : null,
+    source: typeof payload.source === "string" ? payload.source : null,
   };
 }
 
@@ -634,6 +636,7 @@ export async function findCodexSessions(
       startedAt: meta.startedAt,
       updatedAt: indexEntry?.updatedAt ?? null,
       threadName: indexEntry?.threadName ?? null,
+      source: meta.source,
     });
   }
 
