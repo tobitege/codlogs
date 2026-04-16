@@ -22,6 +22,10 @@ Planning and investigation artifacts for this repo live under `devlog/YYYY-MM-DD
 This repository uses Bun as its development package manager and commits `bun.lock`.
 If you are working in this repo, use `bun install` instead of `npm install` or `pnpm install`.
 
+<p align="center">
+  <img src="./codlogs-export-options.png" alt="codlogs" width="500">
+</p>
+
 ## CLI
 
 Install it globally from this folder:
@@ -34,6 +38,8 @@ Use either `codlogs` or `codlogs-sessions`:
 
 ```powershell
 codlogs
+codlogs --json
+codlogs --help
 codlogs d:\github\myDUDreamTool
 codlogs /mnt/d/github/myDUDreamTool
 codlogs --md C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl
@@ -45,10 +51,12 @@ Notes:
 
 - the folder argument is optional; if omitted, the current working directory is used
 - if the folder is inside a git repo, the CLI matches sessions for the repo root by default
+- use `--json` to print machine-readable session results
+- use `-h` or `--help` to show the built-in CLI help text
 - use `--cwd-only` to match only the folder tree you pass in
 - use `--codex-home PATH` if your Codex data lives somewhere other than `%CODEX_HOME%` or `~/.codex`
 - use `--include-images` with `--md` or `--html` to write embedded images into a sibling `.assets` folder
-- use `--html` to export a session as a self-contained HTML transcript
+- use `--html` to export a session as an HTML transcript; with `--include-images`, codlogs writes a sibling `.assets` folder
 - use `--include-tool-results` with `--md` or `--html` to include tool calls and tool outputs in the export
 - Windows drive paths, WSL `/mnt/<drive>/...` paths, and WSL UNC paths are treated as aliases of the same repo
 
@@ -58,7 +66,7 @@ The desktop browser uses [Electrobun](https://electrobun.dev/).
 
 Prerequisites:
 
-- Bun `>=1.3.9`
+- Bun `>=1.3.12`
 - Windows 11+ with WebView2 available for the embedded webview runtime
 
 Run it locally:
@@ -99,6 +107,12 @@ Current desktop app highlights:
 - lets you rename a session title directly from the session list
   - titles are written back to Codex `session_index.jsonl`
   - Codex uses that file as the visible thread-name source of truth
+- each session card has a chat replay button that opens a full-window session browser dialog
+  - read-only transcript view; nothing is executed
+  - searchable with `Ctrl+F`, copyable per entry or with `Copy All`
+  - can hide or show tool calls and tool outputs
+  - skips `developer` messages and the first bootstrap user message to match the export view
+  - truncates very large transcripts at a fixed entry limit and reports skipped oversized rows
 
 ## Large Session Handling
 

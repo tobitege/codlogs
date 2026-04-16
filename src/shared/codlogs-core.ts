@@ -60,6 +60,40 @@ export type SessionDetailMetricsOptions = {
   forceDeepAnalysis?: boolean;
 };
 
+export type SessionTranscriptEntryKind =
+  | "message"
+  | "reasoning"
+  | "tool_call"
+  | "tool_output"
+  | "custom_tool_call"
+  | "custom_tool_output";
+
+export type SessionTranscriptEntry = {
+  index: number;
+  kind: SessionTranscriptEntryKind;
+  role: string | null;
+  timestamp: string | null;
+  title: string;
+  text: string;
+  language: "markdown" | "json" | "text";
+};
+
+export type ReadSessionTranscriptOptions = {
+  maxEntries?: number;
+  signal?: AbortSignal;
+};
+
+export type SessionTranscriptResult = {
+  sessionId: string | null;
+  cwd: string | null;
+  startedAt: string | null;
+  fileSizeBytes: number;
+  entries: SessionTranscriptEntry[];
+  truncated: boolean;
+  omittedBootstrapMessages: number;
+  oversizedLineCount: number;
+};
+
 export type MarkdownExportOptions = {
   includeImages?: boolean;
   includeToolCallResults?: boolean;
@@ -740,6 +774,214 @@ export async function getSessionDetailMetrics(
     largestParsedLineBytes: largestParsedLineBytes > 0 ? largestParsedLineBytes : null,
     oversizedLineCount,
   };
+}
+
+export async function readSessionTranscript(
+  inputPath: string,
+  options: ReadSessionTranscriptOptions = {},
+): Promise<SessionTranscriptResult> {
+  const sessionFilePath = resolveFilesystemPath(inputPath);
+  if (!(await pathExists(sessionFilePath))) {
+    throw new Error(`Session file not found: ${sessionFilePath}`);
+  }
+
+  const stat = await fs.stat(sessionFilePath);
+  const maxEntries = Math.max(1, options.maxEntries ?? 5000);
+
+  const entries: SessionTranscriptEntry[] = [];
+  let sessionId: string | null = null;
+  let cwd: string | null = null;
+  let startedAt: string | null = null;
+  let truncated = false;
+  let omittedBootstrapMessages = 0;
+  let oversizedLineCount = 0;
+  let sawFirstUserMessage = false;
+
+  for await (const event of streamJsonlRecords(sessionFilePath, {
+    signal: options.signal,
+    maxLineBytes: MAX_JSONL_LINE_BYTES_HARD,
+    oversizedStrategy: "emit",
+  })) {
+    if (event.kind === "oversized") {
+      oversizedLineCount += 1;
+      continue;
+    }
+
+    const record = event.record;
+    if (record.type === "session_meta") {
+      const payload = asObject(record.payload);
+      if (payload) {
+        if (typeof payload.id === "string") {
+          sessionId = payload.id;
+        }
+        if (typeof payload.cwd === "string") {
+          cwd = payload.cwd;
+        }
+        if (typeof payload.timestamp === "string") {
+          startedAt = payload.timestamp;
+        }
+      }
+      continue;
+    }
+
+    if (record.type !== "response_item") {
+      continue;
+    }
+
+    const item = asObject(record.payload);
+    if (!item || typeof item.type !== "string") {
+      continue;
+    }
+
+    const timestamp = typeof record.timestamp === "string" ? record.timestamp : null;
+    const entry = buildTranscriptEntry(item, timestamp, entries.length, {
+      setSawFirstUserMessage: () => {
+        sawFirstUserMessage = true;
+      },
+      noteBootstrapOmission: () => {
+        omittedBootstrapMessages += 1;
+      },
+      sawFirstUserMessage,
+    });
+
+    if (!entry) {
+      continue;
+    }
+
+    entries.push(entry);
+    if (entries.length >= maxEntries) {
+      truncated = true;
+      break;
+    }
+  }
+
+  return {
+    sessionId,
+    cwd,
+    startedAt,
+    fileSizeBytes: stat.size,
+    entries,
+    truncated,
+    omittedBootstrapMessages,
+    oversizedLineCount,
+  };
+}
+
+type TranscriptBuildHooks = {
+  sawFirstUserMessage: boolean;
+  setSawFirstUserMessage: () => void;
+  noteBootstrapOmission: () => void;
+};
+
+function buildTranscriptEntry(
+  item: Record<string, unknown>,
+  timestamp: string | null,
+  nextIndex: number,
+  hooks: TranscriptBuildHooks,
+): SessionTranscriptEntry | null {
+  switch (item.type) {
+    case "message": {
+      const role = typeof item.role === "string" ? item.role : "unknown";
+      if (role === "developer") {
+        return null;
+      }
+
+      const text = extractMessageLikeText(item.content);
+      if (!text) {
+        return null;
+      }
+
+      if (!hooks.sawFirstUserMessage && role === "user" && looksLikeBootstrapContext(text)) {
+        hooks.setSawFirstUserMessage();
+        hooks.noteBootstrapOmission();
+        return null;
+      }
+
+      if (role === "user") {
+        hooks.setSawFirstUserMessage();
+      }
+
+      const phase = typeof item.phase === "string" ? ` [${item.phase}]` : "";
+      return {
+        index: nextIndex,
+        kind: "message",
+        role,
+        timestamp,
+        title: `${toTitleCase(role)}${phase}`,
+        text,
+        language: "markdown",
+      };
+    }
+    case "function_call": {
+      const toolName = typeof item.name === "string" ? item.name : "unknown-tool";
+      return {
+        index: nextIndex,
+        kind: "tool_call",
+        role: null,
+        timestamp,
+        title: `Tool Call: ${toolName}`,
+        text: prettyStructuredText(item.arguments),
+        language: "json",
+      };
+    }
+    case "function_call_output": {
+      const callId = typeof item.call_id === "string" ? item.call_id : null;
+      return {
+        index: nextIndex,
+        kind: "tool_output",
+        role: null,
+        timestamp,
+        title: callId ? `Tool Output (${callId})` : "Tool Output",
+        text: prettyStructuredText(item.output),
+        language: "text",
+      };
+    }
+    case "custom_tool_call": {
+      const toolName = typeof item.name === "string" ? item.name : "custom-tool";
+      const status = typeof item.status === "string" ? ` [${item.status}]` : "";
+      return {
+        index: nextIndex,
+        kind: "custom_tool_call",
+        role: null,
+        timestamp,
+        title: `Custom Tool Call: ${toolName}${status}`,
+        text: prettyStructuredText(item.input),
+        language: "text",
+      };
+    }
+    case "custom_tool_call_output": {
+      const callId = typeof item.call_id === "string" ? item.call_id : null;
+      return {
+        index: nextIndex,
+        kind: "custom_tool_output",
+        role: null,
+        timestamp,
+        title: callId ? `Custom Tool Output (${callId})` : "Custom Tool Output",
+        text: prettyStructuredText(item.output),
+        language: "text",
+      };
+    }
+    case "reasoning": {
+      const summaries = Array.isArray(item.summary)
+        ? item.summary.map(extractReasoningSummaryText).filter(Boolean)
+        : [];
+      if (summaries.length === 0) {
+        return null;
+      }
+
+      return {
+        index: nextIndex,
+        kind: "reasoning",
+        role: null,
+        timestamp,
+        title: "Reasoning Summary",
+        text: summaries.map((summary) => `- ${summary}`).join("\n"),
+        language: "markdown",
+      };
+    }
+    default:
+      return null;
+  }
 }
 
 export async function exportSessionJsonlToMarkdown(

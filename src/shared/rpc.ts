@@ -1,5 +1,9 @@
 import type { RPCSchema } from "electrobun/view";
-import type { FindCodexSessionsResult, SessionDetailMetrics } from "./codlogs-core.ts";
+import type {
+  FindCodexSessionsResult,
+  SessionDetailMetrics,
+  SessionTranscriptResult,
+} from "./codlogs-core.ts";
 
 export type EnvironmentCapabilities = {
   codexHome: string;
@@ -68,6 +72,13 @@ export type CodexerRPC = {
           forceDeepAnalysis: boolean;
         };
         response: SessionDetailMetrics;
+      };
+      getSessionTranscript: {
+        params: {
+          sessionFilePath: string;
+          maxEntries: number | null;
+        };
+        response: SessionTranscriptResult;
       };
       getEnvironmentCapabilities: {
         params: {

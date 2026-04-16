@@ -11,6 +11,8 @@ import type {
   FindCodexSessionsResult,
   SessionDetailMetrics,
   SessionMetaMatch,
+  SessionTranscriptEntry,
+  SessionTranscriptResult,
 } from "../shared/codlogs-core.ts";
 import type { CodexerRPC, EnvironmentCapabilities } from "../shared/rpc.ts";
 import { sanitizeSessionTitleInput } from "../shared/session-title.ts";
@@ -60,6 +62,23 @@ type RenameDialogState = {
   title: string;
 };
 
+type SessionBrowserState =
+  | { kind: "idle" }
+  | {
+      kind: "loading";
+      session: SessionMetaMatch;
+    }
+  | {
+      kind: "ready";
+      session: SessionMetaMatch;
+      transcript: SessionTranscriptResult;
+    }
+  | {
+      kind: "error";
+      session: SessionMetaMatch;
+      errorMessage: string;
+    };
+
 type SessionDetailMetricsState = {
   kind: "idle" | "loading" | "ready" | "error";
   metrics: SessionDetailMetrics | null;
@@ -80,6 +99,7 @@ const timestampFormatter = new Intl.DateTimeFormat(undefined, {
 const LARGE_SESSION_WARNING_BYTES = 64 * 1024 * 1024;
 const RPC_MAX_REQUEST_TIME_MS = 15 * 60 * 1000;
 const REPOSITORY_URL = "https://github.com/tobitege/codlogs";
+const SESSION_BROWSER_MAX_ENTRIES = 10000;
 
 const rpc = Electroview.defineRPC<CodexerRPC>({
   maxRequestTime: RPC_MAX_REQUEST_TIME_MS,
@@ -426,6 +446,8 @@ function App() {
   const [renameDialog, setRenameDialog] = useState<RenameDialogState | null>(null);
   const [sanitizedCopyDialog, setSanitizedCopyDialog] =
     useState<SanitizedCopyDialogState | null>(null);
+  const [sessionBrowser, setSessionBrowser] = useState<SessionBrowserState>({ kind: "idle" });
+  const sessionBrowserRequestIdRef = useRef(0);
   const codexHomeRef = useRef(codexHome);
   const folderPathRef = useRef(folderPath);
   const loadRequestIdRef = useRef(0);
@@ -504,6 +526,23 @@ function App() {
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [renameDialog, renameSessionPending]);
+
+  useEffect(() => {
+    if (sessionBrowser.kind === "idle") {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeSessionBrowser();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [sessionBrowser.kind]);
 
   useEffect(() => {
     if (environmentCapabilitiesState.kind === "ready") {
@@ -757,6 +796,40 @@ function App() {
       sessionLabel: getSessionTitle(session),
       title: sanitizeSessionTitleDraft(getSessionTitle(session)),
     });
+  }
+
+  async function openSessionBrowser(session: SessionMetaMatch): Promise<void> {
+    const requestId = sessionBrowserRequestIdRef.current + 1;
+    sessionBrowserRequestIdRef.current = requestId;
+    setSessionBrowser({ kind: "loading", session });
+
+    try {
+      const transcript = await getRpc().request.getSessionTranscript({
+        sessionFilePath: session.file,
+        maxEntries: SESSION_BROWSER_MAX_ENTRIES,
+      });
+
+      if (requestId !== sessionBrowserRequestIdRef.current) {
+        return;
+      }
+
+      setSessionBrowser({ kind: "ready", session, transcript });
+    } catch (transcriptError) {
+      if (requestId !== sessionBrowserRequestIdRef.current) {
+        return;
+      }
+
+      setSessionBrowser({
+        kind: "error",
+        session,
+        errorMessage: asErrorMessage(transcriptError),
+      });
+    }
+  }
+
+  function closeSessionBrowser(): void {
+    sessionBrowserRequestIdRef.current += 1;
+    setSessionBrowser({ kind: "idle" });
   }
 
   function openSanitizedCopyDialog(): void {
@@ -1430,6 +1503,36 @@ function App() {
                     <span className="session-title">{getSessionTitle(session)}</span>
                     <span className="session-cwd">{session.cwd}</span>
                     <button
+                      aria-label="Open session browser"
+                      className="session-browser-button"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        void openSessionBrowser(session);
+                      }}
+                      onKeyDown={(event) => {
+                        event.stopPropagation();
+                      }}
+                      title="Open chat replay"
+                      type="button"
+                    >
+                      <svg
+                        aria-hidden="true"
+                        className="button-icon"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        xmlns="http://www.w3.org/2000/svg"
+                      >
+                        <path
+                          d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v7A2.5 2.5 0 0 1 17.5 16H13l-3.6 3.2A.75.75 0 0 1 8 18.64V16H6.5A2.5 2.5 0 0 1 4 13.5v-7Z"
+                          stroke="currentColor"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="1.7"
+                        />
+                      </svg>
+                    </button>
+                    <button
                       aria-label="Rename session"
                       className="session-rename-button"
                       disabled={
@@ -1759,6 +1862,12 @@ function App() {
           sessionTitle={activeSession ? getSessionTitle(activeSession) : "Selected session"}
           stage={sanitizedCopyState.stage}
           cancelLabel="Cancel Job"
+        />
+      )}
+      {sessionBrowser.kind !== "idle" && (
+        <SessionBrowserDialog
+          onClose={closeSessionBrowser}
+          state={sessionBrowser}
         />
       )}
     </div>
@@ -2237,6 +2346,457 @@ function SanitizedCopyDialog(props: {
           >
             Create Sanitized Output
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function getTranscriptEntryRoleClass(entry: SessionTranscriptEntry): string {
+  if (entry.kind !== "message") {
+    return `transcript-entry-${entry.kind.replace(/_/g, "-")}`;
+  }
+
+  const normalizedRole =
+    entry.role === "user" || entry.role === "assistant" || entry.role === "system"
+      ? entry.role
+      : "other";
+  return `transcript-entry-message transcript-entry-role-${normalizedRole}`;
+}
+
+function formatTranscriptEntryTimestamp(value: string | null): string {
+  if (!value) {
+    return "unknown time";
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? value : timestampFormatter.format(parsed);
+}
+
+function entryMatchesQuery(entry: SessionTranscriptEntry, query: string): boolean {
+  if (!query) {
+    return true;
+  }
+
+  const needle = query.toLowerCase();
+  return (
+    entry.title.toLowerCase().includes(needle) ||
+    entry.text.toLowerCase().includes(needle) ||
+    (entry.role?.toLowerCase().includes(needle) ?? false)
+  );
+}
+
+function CopyIcon(props: { className?: string }): JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      className={props.className}
+      fill="none"
+      viewBox="0 0 24 24"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <rect
+        x="8.5"
+        y="8.5"
+        width="11"
+        height="11"
+        rx="2.2"
+        stroke="currentColor"
+        strokeWidth="1.7"
+      />
+      <path
+        d="M5.5 15.5h-.25A1.75 1.75 0 0 1 3.5 13.75v-9A1.75 1.75 0 0 1 5.25 3h9A1.75 1.75 0 0 1 16 4.75V5"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function CloseIcon(props: { className?: string }): JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      className={props.className}
+      fill="none"
+      viewBox="0 0 24 24"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <path
+        d="M6 6l12 12M18 6 6 18"
+        stroke="currentColor"
+        strokeWidth="1.9"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function FilterIcon(props: { className?: string }): JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      className={props.className}
+      fill="none"
+      viewBox="0 0 24 24"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <path
+        d="M4 5h16l-6 8v5.25a.75.75 0 0 1-1.18.61l-2.5-1.75A.75.75 0 0 1 10 16.5V13L4 5Z"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function isToolCallTranscriptEntry(entry: SessionTranscriptEntry): boolean {
+  return (
+    entry.kind === "tool_call" ||
+    entry.kind === "tool_output" ||
+    entry.kind === "custom_tool_call" ||
+    entry.kind === "custom_tool_output"
+  );
+}
+
+function SessionBrowserDialog(props: {
+  onClose: () => void;
+  state: Exclude<SessionBrowserState, { kind: "idle" }>;
+}) {
+  const { state } = props;
+  const [query, setQuery] = useState("");
+  const [showToolCalls, setShowToolCalls] = useState(true);
+  const [copyFeedback, setCopyFeedback] = useState<{ index: number; ok: boolean } | null>(null);
+  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const deferredQuery = useDeferredValue(query);
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimerRef.current) {
+        clearTimeout(copyResetTimerRef.current);
+        copyResetTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    setQuery("");
+    setShowToolCalls(true);
+    setCopyFeedback(null);
+  }, [state.session.file]);
+
+  useEffect(() => {
+    if (state.kind !== "ready") {
+      return;
+    }
+
+    bodyRef.current?.focus({ preventScroll: true });
+  }, [state.kind, state.session.file]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        const input = searchInputRef.current;
+        if (input) {
+          input.focus();
+          input.select();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, []);
+
+  const entries = state.kind === "ready" ? state.transcript.entries : [];
+  const visibleEntries = showToolCalls
+    ? entries
+    : entries.filter((entry) => !isToolCallTranscriptEntry(entry));
+  const hiddenToolCallCount = entries.length - visibleEntries.length;
+  const trimmedQuery = deferredQuery.trim();
+  const filteredEntries = trimmedQuery
+    ? visibleEntries.filter((entry) => entryMatchesQuery(entry, trimmedQuery))
+    : visibleEntries;
+
+  const handleCopyEntry = async (entry: SessionTranscriptEntry): Promise<void> => {
+    const payload = `${entry.title}\n\n${entry.text}`;
+    let ok = false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(payload);
+        ok = true;
+      }
+    } catch {
+      ok = false;
+    }
+
+    setCopyFeedback({ index: entry.index, ok });
+    if (copyResetTimerRef.current) {
+      clearTimeout(copyResetTimerRef.current);
+    }
+    copyResetTimerRef.current = setTimeout(() => {
+      setCopyFeedback(null);
+      copyResetTimerRef.current = null;
+    }, 1600);
+  };
+
+  const handleCopyAll = async (): Promise<void> => {
+    if (state.kind !== "ready") {
+      return;
+    }
+
+    const payload = state.transcript.entries
+      .map((entry) => `## ${entry.title}\n${formatTranscriptEntryTimestamp(entry.timestamp)}\n\n${entry.text}`)
+      .join("\n\n---\n\n");
+
+    let ok = false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(payload);
+        ok = true;
+      }
+    } catch {
+      ok = false;
+    }
+
+    setCopyFeedback({ index: -1, ok });
+    if (copyResetTimerRef.current) {
+      clearTimeout(copyResetTimerRef.current);
+    }
+    copyResetTimerRef.current = setTimeout(() => {
+      setCopyFeedback(null);
+      copyResetTimerRef.current = null;
+    }, 1600);
+  };
+
+  const sessionTitle = getSessionTitle(state.session);
+
+  return (
+    <div className="session-browser-overlay" onClick={props.onClose}>
+      <div
+        aria-modal="true"
+        className="session-browser"
+        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <header className="session-browser-header">
+          <div className="session-browser-title">
+            <span className="dialog-kicker">Session replay</span>
+            <h2>{sessionTitle}</h2>
+            <p className="session-browser-subtitle">
+              {state.session.cwd}
+            </p>
+          </div>
+          <div className="session-browser-header-actions">
+            <button
+              className="session-browser-action"
+              disabled={state.kind !== "ready" || entries.length === 0}
+              onClick={() => void handleCopyAll()}
+              type="button"
+            >
+              <CopyIcon className="session-browser-action-icon" />
+              <span>
+                {copyFeedback?.index === -1
+                  ? copyFeedback.ok
+                    ? "Copied"
+                    : "Copy failed"
+                  : "Copy All"}
+              </span>
+            </button>
+            <button
+              aria-label="Close session browser"
+              className="session-browser-action"
+              onClick={props.onClose}
+              type="button"
+            >
+              <CloseIcon className="session-browser-action-icon" />
+              <span>Close</span>
+            </button>
+          </div>
+        </header>
+
+        <div className="session-browser-toolbar">
+          <div className="search-container compact session-browser-search">
+            <span className="search-icon">🔍</span>
+            <input
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search this session transcript... (Ctrl+F)"
+              ref={searchInputRef}
+              type="search"
+              value={query}
+            />
+          </div>
+          <button
+            aria-pressed={!showToolCalls}
+            className={`session-browser-action session-browser-filter${
+              !showToolCalls ? " session-browser-filter-active" : ""
+            }`}
+            disabled={state.kind !== "ready"}
+            onClick={() => setShowToolCalls((current) => !current)}
+            title={
+              showToolCalls
+                ? "Hide tool calls and tool outputs"
+                : "Show tool calls and tool outputs"
+            }
+            type="button"
+          >
+            <FilterIcon className="session-browser-action-icon" />
+            <span>{showToolCalls ? "Hide tool calls" : "Show tool calls"}</span>
+          </button>
+          <div className="session-browser-meta">
+            {state.kind === "ready" ? (
+              <>
+                <span>
+                  {filteredEntries.length} / {entries.length}{" "}
+                  {entries.length === 1 ? "entry" : "entries"}
+                </span>
+                {hiddenToolCallCount > 0 && (
+                  <span>
+                    {hiddenToolCallCount} tool{" "}
+                    {hiddenToolCallCount === 1 ? "entry" : "entries"} hidden
+                  </span>
+                )}
+                {state.transcript.truncated && (
+                  <span className="session-browser-meta-warning">
+                    Truncated at {SESSION_BROWSER_MAX_ENTRIES}
+                  </span>
+                )}
+                {state.transcript.omittedBootstrapMessages > 0 && (
+                  <span>
+                    {state.transcript.omittedBootstrapMessages} bootstrap{" "}
+                    {state.transcript.omittedBootstrapMessages === 1 ? "message" : "messages"}{" "}
+                    hidden
+                  </span>
+                )}
+                {state.transcript.oversizedLineCount > 0 && (
+                  <span className="session-browser-meta-warning">
+                    {state.transcript.oversizedLineCount} oversized row
+                    {state.transcript.oversizedLineCount === 1 ? "" : "s"} skipped
+                  </span>
+                )}
+              </>
+            ) : state.kind === "loading" ? (
+              <span>Loading transcript...</span>
+            ) : (
+              <span className="session-browser-meta-warning">Transcript unavailable</span>
+            )}
+          </div>
+        </div>
+
+        <div
+          className="session-browser-body"
+          ref={bodyRef}
+          tabIndex={-1}
+          onKeyDown={(event) => {
+            const node = bodyRef.current;
+            if (!node) {
+              return;
+            }
+
+            const pageStep = Math.max(node.clientHeight - 80, 80);
+            switch (event.key) {
+              case "PageDown":
+                event.preventDefault();
+                node.scrollBy({ top: pageStep });
+                break;
+              case "PageUp":
+                event.preventDefault();
+                node.scrollBy({ top: -pageStep });
+                break;
+              case "Home":
+                event.preventDefault();
+                node.scrollTo({ top: 0 });
+                break;
+              case "End":
+                event.preventDefault();
+                node.scrollTo({ top: node.scrollHeight });
+                break;
+              case "ArrowDown":
+                event.preventDefault();
+                node.scrollBy({ top: 60 });
+                break;
+              case "ArrowUp":
+                event.preventDefault();
+                node.scrollBy({ top: -60 });
+                break;
+              default:
+                break;
+            }
+          }}
+        >
+          {state.kind === "loading" && (
+            <div className="session-browser-placeholder">
+              <span className="empty-icon">⏳</span>
+              <p>Reading session transcript...</p>
+            </div>
+          )}
+          {state.kind === "error" && (
+            <div className="session-browser-placeholder">
+              <span className="empty-icon">⚠️</span>
+              <p>{state.errorMessage}</p>
+            </div>
+          )}
+          {state.kind === "ready" && entries.length === 0 && (
+            <div className="session-browser-placeholder">
+              <span className="empty-icon">📭</span>
+              <p>No transcript entries were found in this session.</p>
+            </div>
+          )}
+          {state.kind === "ready" && entries.length > 0 && filteredEntries.length === 0 && (
+            <div className="session-browser-placeholder">
+              <span className="empty-icon">🔍</span>
+              <p>
+                {visibleEntries.length === 0
+                  ? "All entries in this session are tool calls and are currently hidden."
+                  : "No entries match this search."}
+              </p>
+            </div>
+          )}
+          {state.kind === "ready" && filteredEntries.length > 0 && (
+            <ol className="session-browser-transcript">
+              {filteredEntries.map((entry) => (
+                <li
+                  className={`transcript-entry ${getTranscriptEntryRoleClass(entry)}`}
+                  key={entry.index}
+                >
+                  <div className="transcript-entry-header">
+                    <span className="transcript-entry-title">
+                      <span className="transcript-entry-index">#{entry.index + 1}</span>
+                      {entry.title}
+                    </span>
+                    <span className="transcript-entry-time">
+                      {formatTranscriptEntryTimestamp(entry.timestamp)}
+                    </span>
+                    <button
+                      className="session-browser-action transcript-copy-button"
+                      onClick={() => void handleCopyEntry(entry)}
+                      type="button"
+                    >
+                      <CopyIcon className="session-browser-action-icon" />
+                      <span>
+                        {copyFeedback?.index === entry.index
+                          ? copyFeedback.ok
+                            ? "Copied"
+                            : "Copy failed"
+                          : "Copy"}
+                      </span>
+                    </button>
+                  </div>
+                  <pre className={`transcript-entry-body transcript-lang-${entry.language}`}>
+                    {entry.text}
+                  </pre>
+                </li>
+              ))}
+            </ol>
+          )}
         </div>
       </div>
     </div>

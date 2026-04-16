@@ -12,6 +12,7 @@ import {
   exportSessionJsonlToHtml,
   findCodexSessions,
   getSessionDetailMetrics,
+  readSessionTranscript,
 } from "../shared/codlogs-core.ts";
 import type { CodexerRPC, EnvironmentCapabilities } from "../shared/rpc.ts";
 import {
@@ -1348,6 +1349,10 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
       getSessionDetailMetrics: async ({ sessionFilePath, forceDeepAnalysis }) =>
         getSessionDetailMetrics(sessionFilePath, {
           forceDeepAnalysis,
+        }),
+      getSessionTranscript: async ({ sessionFilePath, maxEntries }) =>
+        readSessionTranscript(sessionFilePath, {
+          maxEntries: maxEntries ?? undefined,
         }),
       getEnvironmentCapabilities: async ({ codexHome }) =>
         getEnvironmentCapabilities(codexHome),
