@@ -4,7 +4,7 @@ export default {
   app: {
     name: "codlogs",
     identifier: "dev.tobitege.codlogs",
-    version: "1.2.0",
+    version: "1.2.1",
   },
   build: {
     copy: {
