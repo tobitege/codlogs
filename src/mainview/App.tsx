@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
+  type ReactElement,
 } from "react";
 import type {
   FindCodexSessionsResult,
@@ -299,7 +300,7 @@ function getAnalysisBannerCopy(
   return null;
 }
 
-function GitHubMark(props: { className?: string }): JSX.Element {
+function GitHubMark(props: { className?: string }): ReactElement {
   return (
     <svg
       aria-hidden="true"
@@ -2386,7 +2387,7 @@ function entryMatchesQuery(entry: SessionTranscriptEntry, query: string): boolea
   );
 }
 
-function CopyIcon(props: { className?: string }): JSX.Element {
+function CopyIcon(props: { className?: string }): ReactElement {
   return (
     <svg
       aria-hidden="true"
@@ -2414,7 +2415,7 @@ function CopyIcon(props: { className?: string }): JSX.Element {
   );
 }
 
-function CloseIcon(props: { className?: string }): JSX.Element {
+function CloseIcon(props: { className?: string }): ReactElement {
   return (
     <svg
       aria-hidden="true"
@@ -2433,7 +2434,7 @@ function CloseIcon(props: { className?: string }): JSX.Element {
   );
 }
 
-function FilterIcon(props: { className?: string }): JSX.Element {
+function FilterIcon(props: { className?: string }): ReactElement {
   return (
     <svg
       aria-hidden="true"
