@@ -1,6 +1,6 @@
 {
   "name": "codlogs",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "private": true,
   "description": "Codex session CLI and Electrobun browser.",
   "license": "UNLICENSED",
@@ -33,9 +33,9 @@
     "bun": ">=1.3.12"
   },
   "dependencies": {
-    "electrobun": "1.16.0",
-    "react": "^19.2.5",
-    "react-dom": "^19.2.5"
+    "electrobun": "1.18.1",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
   },
   "devDependencies": {
     "@types/bun": "^1.3.13",
@@ -44,6 +44,6 @@
     "@vitejs/plugin-react": "^6.0.1",
     "concurrently": "^9.2.1",
     "typescript": "^6.0.3",
-    "vite": "^8.0.10"
+    "vite": "8.0.11"
   }
 }
