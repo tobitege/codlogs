@@ -12,13 +12,18 @@ import {
   exportSessionJsonlToHtml,
   findCodexSessions,
   getSessionDetailMetrics,
+  mergeErroredToolCallPatterns,
+  readSessionErroredToolCalls,
   readSessionTranscript,
   readSessionTokenUsage,
+  type SessionErroredToolCallPattern,
   type SessionTokenUsage,
 } from "../shared/codlogs-core.ts";
 import type {
   CodexerRPC,
   EnvironmentCapabilities,
+  ErroredToolCallSummaryJobStatus,
+  ErroredToolCallSummaryResult,
   TokenUsageSummaryJobStatus,
   TokenUsageSummaryResult,
 } from "../shared/rpc.ts";
@@ -118,9 +123,40 @@ type SanitizedCopyJobRecord = {
   status: ExportJobStatus;
 };
 
-type TokenUsageSummaryJobRecord = {
+type SessionSummaryJobStatus<TResult> = {
+  kind: "working" | "success" | "error" | "cancelled";
+  progressPercent: number;
+  stage: string;
+  message: string;
+  scannedSessionCount: number;
+  totalSessionCount: number;
+  currentSessionPath: string | null;
+  result: TResult | null;
+};
+
+type SessionSummaryJobRecord<TStatus extends SessionSummaryJobStatus<unknown>> = {
   controller: AbortController;
-  status: TokenUsageSummaryJobStatus;
+  status: TStatus;
+};
+
+type TokenUsageSummaryJobRecord = SessionSummaryJobRecord<TokenUsageSummaryJobStatus>;
+
+type ErroredToolCallSummaryJobRecord =
+  SessionSummaryJobRecord<ErroredToolCallSummaryJobStatus>;
+
+type SessionScanReadResult = {
+  fileSizeBytes: number;
+  oversizedLineCount: number;
+};
+
+type SessionScanCounts = {
+  scannedSessionCount: number;
+  sessionsWithData: number;
+  sessionsWithoutData: number;
+  failedSessionCount: number;
+  fileSizeBytes: number;
+  oversizedLineCount: number;
+  totalSessionCount: number;
 };
 
 type SessionMetaRecord = {
@@ -139,6 +175,7 @@ const EXPORT_JOB_RETENTION_MS = 5 * 60 * 1000;
 const exportJobs = new Map<string, ExportJobRecord>();
 const sanitizedCopyJobs = new Map<string, SanitizedCopyJobRecord>();
 const tokenUsageSummaryJobs = new Map<string, TokenUsageSummaryJobRecord>();
+const erroredToolCallSummaryJobs = new Map<string, ErroredToolCallSummaryJobRecord>();
 const DEFAULT_WINDOW_FRAME = {
   width: 1600,
   height: 1000,
@@ -187,12 +224,14 @@ function getSanitizedCopyJobStatus(jobId: string): ExportJobStatus {
   return sanitizedCopyJobs.get(jobId)?.status ?? getMissingSanitizedCopyJobStatus();
 }
 
-function getMissingTokenUsageSummaryJobStatus(): TokenUsageSummaryJobStatus {
+function getMissingSessionSummaryJobStatus<TResult>(
+  message: string,
+): SessionSummaryJobStatus<TResult> {
   return {
     kind: "error",
     progressPercent: 0,
     stage: "missing",
-    message: "The token summary job is no longer available.",
+    message,
     scannedSessionCount: 0,
     totalSessionCount: 0,
     currentSessionPath: null,
@@ -200,8 +239,29 @@ function getMissingTokenUsageSummaryJobStatus(): TokenUsageSummaryJobStatus {
   };
 }
 
+function getMissingTokenUsageSummaryJobStatus(): TokenUsageSummaryJobStatus {
+  return getMissingSessionSummaryJobStatus<TokenUsageSummaryResult>(
+    "The token summary job is no longer available.",
+  );
+}
+
+function getMissingErroredToolCallSummaryJobStatus(): ErroredToolCallSummaryJobStatus {
+  return getMissingSessionSummaryJobStatus<ErroredToolCallSummaryResult>(
+    "The tool error summary job is no longer available.",
+  );
+}
+
 function getTokenUsageSummaryJobStatus(jobId: string): TokenUsageSummaryJobStatus {
   return tokenUsageSummaryJobs.get(jobId)?.status ?? getMissingTokenUsageSummaryJobStatus();
+}
+
+function getErroredToolCallSummaryJobStatus(
+  jobId: string,
+): ErroredToolCallSummaryJobStatus {
+  return (
+    erroredToolCallSummaryJobs.get(jobId)?.status ??
+    getMissingErroredToolCallSummaryJobStatus()
+  );
 }
 
 function setExportJobStatus(jobId: string, status: ExportJobStatus): void {
@@ -222,16 +282,31 @@ function setSanitizedCopyJobStatus(jobId: string, status: ExportJobStatus): void
   existing.status = status;
 }
 
-function setTokenUsageSummaryJobStatus(
+function setSessionSummaryJobStatus<TStatus extends SessionSummaryJobStatus<unknown>>(
+  jobs: Map<string, SessionSummaryJobRecord<TStatus>>,
   jobId: string,
-  status: TokenUsageSummaryJobStatus,
+  status: TStatus,
 ): void {
-  const existing = tokenUsageSummaryJobs.get(jobId);
+  const existing = jobs.get(jobId);
   if (!existing) {
     return;
   }
 
   existing.status = status;
+}
+
+function setTokenUsageSummaryJobStatus(
+  jobId: string,
+  status: TokenUsageSummaryJobStatus,
+): void {
+  setSessionSummaryJobStatus(tokenUsageSummaryJobs, jobId, status);
+}
+
+function setErroredToolCallSummaryJobStatus(
+  jobId: string,
+  status: ErroredToolCallSummaryJobStatus,
+): void {
+  setSessionSummaryJobStatus(erroredToolCallSummaryJobs, jobId, status);
 }
 
 function updateExportJobProgress(jobId: string, progress: ExportProgress): void {
@@ -539,14 +614,21 @@ function addTokenUsage(
   };
 }
 
-function scheduleTokenUsageSummaryJobCleanup(jobId: string): void {
+function scheduleSessionSummaryJobCleanup<TStatus extends SessionSummaryJobStatus<unknown>>(
+  jobs: Map<string, SessionSummaryJobRecord<TStatus>>,
+  jobId: string,
+): void {
   setTimeout(() => {
-    tokenUsageSummaryJobs.delete(jobId);
+    jobs.delete(jobId);
   }, EXPORT_JOB_RETENTION_MS);
 }
 
-function cancelTokenUsageSummaryJob(jobId: string): { ok: boolean } {
-  const existing = tokenUsageSummaryJobs.get(jobId);
+function cancelSessionSummaryJob<TStatus extends SessionSummaryJobStatus<unknown>>(
+  jobs: Map<string, SessionSummaryJobRecord<TStatus>>,
+  jobId: string,
+  cancellingMessage: string,
+): { ok: boolean } {
+  const existing = jobs.get(jobId);
   if (!existing || existing.status.kind !== "working") {
     return { ok: false };
   }
@@ -554,63 +636,89 @@ function cancelTokenUsageSummaryJob(jobId: string): { ok: boolean } {
   existing.controller.abort();
   existing.status = {
     ...existing.status,
-    message: "Cancelling token summary...",
+    message: cancellingMessage,
   };
   return { ok: true };
 }
 
-function startTokenUsageSummaryJob(options: {
+function startSessionSummaryJob<
+  TScanResult extends SessionScanReadResult,
+  TAccumulator,
+  TResult,
+  TStatus extends SessionSummaryJobStatus<TResult>,
+>(options: {
   sessionFilePaths: string[];
+  jobs: Map<string, SessionSummaryJobRecord<TStatus>>;
+  setStatus: (jobId: string, status: TStatus) => void;
+  getStatus: (jobId: string) => TStatus;
+  createAccumulator: () => TAccumulator;
+  readSession: (
+    sessionFilePath: string,
+    options: {
+      signal: AbortSignal;
+      onProgress: (progress: { bytesProcessed: number; fileSizeBytes: number }) => void;
+    },
+  ) => Promise<TScanResult>;
+  accumulate: (accumulator: TAccumulator, result: TScanResult) => void;
+  hasData: (result: TScanResult) => boolean;
+  buildResult: (accumulator: TAccumulator, counts: SessionScanCounts) => TResult;
+  successMessage: (result: TResult, counts: SessionScanCounts) => string;
+  cancelledMessage: string;
+  preparingMessage: (sessionCount: number) => string;
+  scanningMessage: (sessionLabel: string) => string;
 }): { jobId: string } {
   const sessionFilePaths = Array.from(new Set(options.sessionFilePaths));
   const jobId = crypto.randomUUID();
   const controller = new AbortController();
-  tokenUsageSummaryJobs.set(jobId, {
+  options.jobs.set(jobId, {
     controller,
     status: {
       kind: "working",
       progressPercent: 1,
       stage: "starting",
-      message: `Preparing ${sessionFilePaths.length} session${sessionFilePaths.length === 1 ? "" : "s"}...`,
+      message: options.preparingMessage(sessionFilePaths.length),
       scannedSessionCount: 0,
       totalSessionCount: sessionFilePaths.length,
       currentSessionPath: null,
       result: null,
-    },
+    } as TStatus,
   });
 
   void (async () => {
-    const tokenUsage = createEmptyTokenUsage();
-    let scannedSessionCount = 0;
-    let sessionsWithTokenUsage = 0;
-    let sessionsWithoutTokenUsage = 0;
-    let failedSessionCount = 0;
-    let fileSizeBytes = 0;
-    let oversizedLineCount = 0;
-    let tokenCountRows = 0;
+    const accumulator = options.createAccumulator();
+    const counts: SessionScanCounts = {
+      scannedSessionCount: 0,
+      sessionsWithData: 0,
+      sessionsWithoutData: 0,
+      failedSessionCount: 0,
+      fileSizeBytes: 0,
+      oversizedLineCount: 0,
+      totalSessionCount: sessionFilePaths.length,
+    };
 
     try {
       for (let index = 0; index < sessionFilePaths.length; index += 1) {
         throwIfAborted(controller.signal);
         const sessionFilePath = sessionFilePaths[index] ?? "";
         const currentSessionLabel = path.basename(sessionFilePath);
+        const message = options.scanningMessage(currentSessionLabel);
 
-        setTokenUsageSummaryJobStatus(jobId, {
+        options.setStatus(jobId, {
           kind: "working",
           progressPercent: Math.max(
             2,
             Math.round((index / Math.max(sessionFilePaths.length, 1)) * 96),
           ),
           stage: "scanning",
-          message: `Scanning ${currentSessionLabel}...`,
-          scannedSessionCount,
+          message,
+          scannedSessionCount: counts.scannedSessionCount,
           totalSessionCount: sessionFilePaths.length,
           currentSessionPath: sessionFilePath,
           result: null,
-        });
+        } as TStatus);
 
         try {
-          const result = await readSessionTokenUsage(sessionFilePath, {
+          const result = await options.readSession(sessionFilePath, {
             signal: controller.signal,
             onProgress: (progress) => {
               const currentFileProgress =
@@ -618,71 +726,58 @@ function startTokenUsageSummaryJob(options: {
               const progressRatio =
                 (index + Math.min(1, currentFileProgress)) /
                 Math.max(sessionFilePaths.length, 1);
-              setTokenUsageSummaryJobStatus(jobId, {
+              options.setStatus(jobId, {
                 kind: "working",
                 progressPercent: Math.max(2, Math.min(98, Math.round(progressRatio * 98))),
                 stage: "scanning",
-                message: `Scanning ${currentSessionLabel}...`,
-                scannedSessionCount,
+                message,
+                scannedSessionCount: counts.scannedSessionCount,
                 totalSessionCount: sessionFilePaths.length,
                 currentSessionPath: sessionFilePath,
                 result: null,
-              });
+              } as TStatus);
             },
           });
 
-          scannedSessionCount += 1;
-          fileSizeBytes += result.fileSizeBytes;
-          oversizedLineCount += result.oversizedLineCount;
-          tokenCountRows += result.tokenCountRows;
-          if (result.tokenUsage) {
-            const nextTokenUsage = addTokenUsage(tokenUsage, result.tokenUsage);
-            Object.assign(tokenUsage, nextTokenUsage);
-            sessionsWithTokenUsage += 1;
+          counts.scannedSessionCount += 1;
+          counts.fileSizeBytes += result.fileSizeBytes;
+          counts.oversizedLineCount += result.oversizedLineCount;
+          options.accumulate(accumulator, result);
+          if (options.hasData(result)) {
+            counts.sessionsWithData += 1;
           } else {
-            sessionsWithoutTokenUsage += 1;
+            counts.sessionsWithoutData += 1;
           }
-        } catch (error) {
+        } catch {
           throwIfAborted(controller.signal);
-          failedSessionCount += 1;
-          scannedSessionCount += 1;
+          counts.failedSessionCount += 1;
+          counts.scannedSessionCount += 1;
         }
       }
 
-      const result: TokenUsageSummaryResult = {
-        sessionCount: sessionFilePaths.length,
-        scannedSessionCount,
-        sessionsWithTokenUsage,
-        sessionsWithoutTokenUsage,
-        failedSessionCount,
-        fileSizeBytes,
-        oversizedLineCount,
-        tokenCountRows,
-        tokenUsage,
-      };
-
-      setTokenUsageSummaryJobStatus(jobId, {
+      const result = options.buildResult(accumulator, counts);
+      options.setStatus(jobId, {
         kind: "success",
         progressPercent: 100,
         stage: "done",
-        message: `Summarized ${sessionsWithTokenUsage} session${sessionsWithTokenUsage === 1 ? "" : "s"} with token data.`,
-        scannedSessionCount,
+        message: options.successMessage(result, counts),
+        scannedSessionCount: counts.scannedSessionCount,
         totalSessionCount: sessionFilePaths.length,
         currentSessionPath: null,
         result,
-      });
+      } as TStatus);
     } catch (error) {
       if (wasExportCancelled(error)) {
-        setTokenUsageSummaryJobStatus(jobId, {
-          ...getTokenUsageSummaryJobStatus(jobId),
+        options.setStatus(jobId, {
+          ...options.getStatus(jobId),
           kind: "cancelled",
           stage: "cancelled",
-          message: "Token summary cancelled.",
+          message: options.cancelledMessage,
           currentSessionPath: null,
         });
       } else {
-        setTokenUsageSummaryJobStatus(jobId, {
-          ...getTokenUsageSummaryJobStatus(jobId),
+        options.setStatus(jobId, {
+          ...options.getStatus(jobId),
           kind: "error",
           stage: "error",
           message: asErrorMessage(error),
@@ -690,11 +785,116 @@ function startTokenUsageSummaryJob(options: {
         });
       }
     } finally {
-      scheduleTokenUsageSummaryJobCleanup(jobId);
+      scheduleSessionSummaryJobCleanup(options.jobs, jobId);
     }
   })();
 
   return { jobId };
+}
+
+function cancelTokenUsageSummaryJob(jobId: string): { ok: boolean } {
+  return cancelSessionSummaryJob(
+    tokenUsageSummaryJobs,
+    jobId,
+    "Cancelling token summary...",
+  );
+}
+
+function startTokenUsageSummaryJob(options: {
+  sessionFilePaths: string[];
+}): { jobId: string } {
+  return startSessionSummaryJob({
+    sessionFilePaths: options.sessionFilePaths,
+    jobs: tokenUsageSummaryJobs,
+    setStatus: setTokenUsageSummaryJobStatus,
+    getStatus: getTokenUsageSummaryJobStatus,
+    createAccumulator: () => ({
+      tokenUsage: createEmptyTokenUsage(),
+      tokenCountRows: 0,
+    }),
+    readSession: readSessionTokenUsage,
+    accumulate: (accumulator, result) => {
+      accumulator.tokenCountRows += result.tokenCountRows;
+      if (result.tokenUsage) {
+        Object.assign(accumulator.tokenUsage, addTokenUsage(
+          accumulator.tokenUsage,
+          result.tokenUsage,
+        ));
+      }
+    },
+    hasData: (result) => result.tokenUsage !== null,
+    buildResult: (accumulator, counts): TokenUsageSummaryResult => ({
+      sessionCount: counts.totalSessionCount,
+      scannedSessionCount: counts.scannedSessionCount,
+      sessionsWithTokenUsage: counts.sessionsWithData,
+      sessionsWithoutTokenUsage: counts.sessionsWithoutData,
+      failedSessionCount: counts.failedSessionCount,
+      fileSizeBytes: counts.fileSizeBytes,
+      oversizedLineCount: counts.oversizedLineCount,
+      tokenCountRows: accumulator.tokenCountRows,
+      tokenUsage: accumulator.tokenUsage,
+    }),
+    successMessage: (_result, counts) =>
+      `Summarized ${counts.sessionsWithData} session${counts.sessionsWithData === 1 ? "" : "s"} with token data.`,
+    cancelledMessage: "Token summary cancelled.",
+    preparingMessage: (sessionCount) =>
+      `Preparing ${sessionCount} session${sessionCount === 1 ? "" : "s"}...`,
+    scanningMessage: (sessionLabel) => `Scanning ${sessionLabel}...`,
+  });
+}
+
+function cancelErroredToolCallSummaryJob(jobId: string): { ok: boolean } {
+  return cancelSessionSummaryJob(
+    erroredToolCallSummaryJobs,
+    jobId,
+    "Cancelling tool error summary...",
+  );
+}
+
+function startErroredToolCallSummaryJob(options: {
+  sessionFilePaths: string[];
+}): { jobId: string } {
+  return startSessionSummaryJob({
+    sessionFilePaths: options.sessionFilePaths,
+    jobs: erroredToolCallSummaryJobs,
+    setStatus: setErroredToolCallSummaryJobStatus,
+    getStatus: getErroredToolCallSummaryJobStatus,
+    createAccumulator: () => ({
+      distinctErroredToolCalls: [] as SessionErroredToolCallPattern[],
+      toolCallRows: 0,
+      toolOutputRows: 0,
+      erroredToolCallCount: 0,
+    }),
+    readSession: readSessionErroredToolCalls,
+    accumulate: (accumulator, result) => {
+      accumulator.toolCallRows += result.toolCallRows;
+      accumulator.toolOutputRows += result.toolOutputRows;
+      accumulator.erroredToolCallCount += result.erroredToolCallCount;
+      accumulator.distinctErroredToolCalls.push(...result.distinctErroredToolCalls);
+    },
+    hasData: (result) => result.erroredToolCallCount > 0,
+    buildResult: (accumulator, counts): ErroredToolCallSummaryResult => ({
+      sessionCount: counts.totalSessionCount,
+      scannedSessionCount: counts.scannedSessionCount,
+      sessionsWithErroredToolCalls: counts.sessionsWithData,
+      sessionsWithoutErroredToolCalls: counts.sessionsWithoutData,
+      failedSessionCount: counts.failedSessionCount,
+      fileSizeBytes: counts.fileSizeBytes,
+      oversizedLineCount: counts.oversizedLineCount,
+      toolCallRows: accumulator.toolCallRows,
+      toolOutputRows: accumulator.toolOutputRows,
+      erroredToolCallCount: accumulator.erroredToolCallCount,
+      distinctErroredToolCalls: mergeErroredToolCallPatterns(
+        accumulator.distinctErroredToolCalls,
+      ),
+    }),
+    successMessage: (result, counts) =>
+      `Found ${result.erroredToolCallCount} errored tool call${result.erroredToolCallCount === 1 ? "" : "s"} across ${counts.sessionsWithData} session${counts.sessionsWithData === 1 ? "" : "s"}.`,
+    cancelledMessage: "Tool error summary cancelled.",
+    preparingMessage: (sessionCount) =>
+      `Preparing ${sessionCount} session${sessionCount === 1 ? "" : "s"}...`,
+    scanningMessage: (sessionLabel) => `Scanning ${sessionLabel}...`,
+  });
 }
 
 async function getSettingsFilePath(): Promise<string> {
@@ -780,14 +980,16 @@ function escapePowerShellString(value: string): string {
 function pickSaveFilePathOnWindows(options: {
   startingFolder: string;
   suggestedFileName: string;
+  filter: string;
+  defaultExt: string;
 }): string | null {
   const script = `
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 $dialog = New-Object System.Windows.Forms.SaveFileDialog
 $dialog.InitialDirectory = '${escapePowerShellString(options.startingFolder)}'
 $dialog.FileName = '${escapePowerShellString(options.suggestedFileName)}'
-$dialog.Filter = 'HTML files (*.html)|*.html|All files (*.*)|*.*'
-$dialog.DefaultExt = 'html'
+$dialog.Filter = '${escapePowerShellString(options.filter)}'
+$dialog.DefaultExt = '${escapePowerShellString(options.defaultExt)}'
 $dialog.AddExtension = $true
 $dialog.OverwritePrompt = $true
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
@@ -806,12 +1008,13 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 function pickSaveFilePathOnDarwin(options: {
   startingFolder: string;
   suggestedFileName: string;
+  prompt: string;
 }): string | null {
   const args = [
     "-e",
     `set defaultLocation to POSIX file "${escapeAppleScriptString(options.startingFolder)}"`,
     "-e",
-    `set pickedFile to choose file name with prompt "Save HTML export as" default location defaultLocation default name "${escapeAppleScriptString(options.suggestedFileName)}"`,
+    `set pickedFile to choose file name with prompt "${escapeAppleScriptString(options.prompt)}" default location defaultLocation default name "${escapeAppleScriptString(options.suggestedFileName)}"`,
     "-e",
     "POSIX path of pickedFile",
   ];
@@ -829,6 +1032,7 @@ function pickSaveFilePathOnDarwin(options: {
 function pickSaveFilePathOnLinux(options: {
   startingFolder: string;
   suggestedFileName: string;
+  fileFilter: string;
 }): string | null {
   const defaultPath = path.join(options.startingFolder, options.suggestedFileName);
   const zenityResult = runDialogProcess("zenity", [
@@ -837,7 +1041,7 @@ function pickSaveFilePathOnLinux(options: {
     "--confirm-overwrite",
     "--filename",
     defaultPath,
-    "--file-filter=*.html",
+    `--file-filter=${options.fileFilter}`,
   ]);
   if (!zenityResult.error && zenityResult.status === 0) {
     return normalizeDialogResult(`${zenityResult.stdout ?? ""}`);
@@ -849,7 +1053,7 @@ function pickSaveFilePathOnLinux(options: {
   const kdialogResult = runDialogProcess("kdialog", [
     "--getsavefilename",
     defaultPath,
-    "*.html | HTML files",
+    options.fileFilter,
   ]);
   if (!kdialogResult.error && kdialogResult.status === 0) {
     return normalizeDialogResult(`${kdialogResult.stdout ?? ""}`);
@@ -859,17 +1063,28 @@ function pickSaveFilePathOnLinux(options: {
   }
 
   throw new Error(
-    "Could not open a Linux save dialog. Install zenity or kdialog, or export with sidecar assets.",
+    "Could not open a Linux save dialog. Install zenity or kdialog.",
   );
 }
 
 async function pickSaveFilePath(options: {
   sessionFilePath: string;
   startingFolder: string;
+  extension: "html" | "md";
+  suggestedFileName?: string;
 }): Promise<string | null> {
+  const isMarkdown = options.extension === "md";
   const dialogOptions = {
     startingFolder: options.startingFolder,
-    suggestedFileName: getSuggestedExportFileName(options.sessionFilePath, "html"),
+    suggestedFileName:
+      options.suggestedFileName ??
+      getSuggestedExportFileName(options.sessionFilePath, options.extension),
+    filter: isMarkdown
+      ? "Markdown files (*.md)|*.md|All files (*.*)|*.*"
+      : "HTML files (*.html)|*.html|All files (*.*)|*.*",
+    defaultExt: options.extension,
+    prompt: isMarkdown ? "Save Markdown file as" : "Save HTML export as",
+    fileFilter: isMarkdown ? "*.md | Markdown files" : "*.html | HTML files",
   };
 
   switch (process.platform) {
@@ -889,6 +1104,43 @@ async function getRememberedOpenedFolder(): Promise<string | null> {
   return typeof settings.lastOpenedFolder === "string"
     ? normalizeDialogResult(settings.lastOpenedFolder)
     : null;
+}
+
+function buildMarkdownSummaryFileName(suggestedFileName: string): string {
+  const trimmed = suggestedFileName.trim();
+  const baseName = trimmed ? path.basename(trimmed) : "codlogs-summary.md";
+  const withoutInvalidCharacters = baseName.replace(/[<>:"/\\|?*\x00-\x1f]/g, "-");
+  const normalized = withoutInvalidCharacters.toLowerCase().endsWith(".md")
+    ? withoutInvalidCharacters
+    : `${withoutInvalidCharacters}.md`;
+  return normalized === ".md" ? "codlogs-summary.md" : normalized;
+}
+
+async function saveMarkdownFile(options: {
+  content: string;
+  suggestedFileName: string;
+}): Promise<{ outputPath: string | null }> {
+  const rememberedDirectory = await getRememberedExportDirectory();
+  const startingFolder = rememberedDirectory ?? getAppWorkingDirectory();
+  const outputPath = await pickSaveFilePath({
+    sessionFilePath: path.join(startingFolder, "codlogs-summary.md"),
+    startingFolder,
+    extension: "md",
+    suggestedFileName: buildMarkdownSummaryFileName(options.suggestedFileName),
+  });
+
+  if (!outputPath) {
+    return { outputPath: null };
+  }
+
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, options.content, "utf8");
+  await rememberExportDirectory(path.dirname(outputPath));
+  Utils.showNotification({
+    title: "codlogs summary saved",
+    body: path.basename(outputPath),
+  });
+  return { outputPath };
 }
 
 async function rememberOpenedFolder(folderPath: string): Promise<void> {
@@ -1560,6 +1812,7 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
             : await pickSaveFilePath({
                 sessionFilePath,
                 startingFolder,
+                extension: "html",
               });
 
         if (selectedPath) {
@@ -1660,14 +1913,27 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
         startTokenUsageSummaryJob({
           sessionFilePaths,
         }),
+      startErroredToolCallSummary: async ({ sessionFilePaths }) =>
+        startErroredToolCallSummaryJob({
+          sessionFilePaths,
+        }),
       getExportJobStatus: async ({ jobId }) => getExportJobStatus(jobId),
       getSanitizedCopyJobStatus: async ({ jobId }) => getSanitizedCopyJobStatus(jobId),
       getTokenUsageSummaryJobStatus: async ({ jobId }) =>
         getTokenUsageSummaryJobStatus(jobId),
+      getErroredToolCallSummaryJobStatus: async ({ jobId }) =>
+        getErroredToolCallSummaryJobStatus(jobId),
       cancelExportJob: async ({ jobId }) => cancelExportJob(jobId),
       cancelSanitizedCopyJob: async ({ jobId }) => cancelSanitizedCopyJob(jobId),
       cancelTokenUsageSummaryJob: async ({ jobId }) =>
         cancelTokenUsageSummaryJob(jobId),
+      cancelErroredToolCallSummaryJob: async ({ jobId }) =>
+        cancelErroredToolCallSummaryJob(jobId),
+      saveMarkdownFile: async ({ content, suggestedFileName }) =>
+        saveMarkdownFile({
+          content,
+          suggestedFileName,
+        }),
       revealPath: ({ path: targetPath }) => {
         Utils.showItemInFolder(targetPath);
         return { ok: true };

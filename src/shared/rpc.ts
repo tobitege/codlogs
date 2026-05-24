@@ -1,6 +1,7 @@
 import type { RPCSchema } from "electrobun/view";
 import type {
   FindCodexSessionsResult,
+  SessionErroredToolCallPattern,
   SessionDetailMetrics,
   SessionTokenUsage,
   SessionTranscriptResult,
@@ -38,6 +39,31 @@ export type TokenUsageSummaryJobStatus = {
   totalSessionCount: number;
   currentSessionPath: string | null;
   result: TokenUsageSummaryResult | null;
+};
+
+export type ErroredToolCallSummaryResult = {
+  sessionCount: number;
+  scannedSessionCount: number;
+  sessionsWithErroredToolCalls: number;
+  sessionsWithoutErroredToolCalls: number;
+  failedSessionCount: number;
+  fileSizeBytes: number;
+  oversizedLineCount: number;
+  toolCallRows: number;
+  toolOutputRows: number;
+  erroredToolCallCount: number;
+  distinctErroredToolCalls: SessionErroredToolCallPattern[];
+};
+
+export type ErroredToolCallSummaryJobStatus = {
+  kind: "working" | "success" | "error" | "cancelled";
+  progressPercent: number;
+  stage: string;
+  message: string;
+  scannedSessionCount: number;
+  totalSessionCount: number;
+  currentSessionPath: string | null;
+  result: ErroredToolCallSummaryResult | null;
 };
 
 export type CodexerRPC = {
@@ -168,6 +194,14 @@ export type CodexerRPC = {
           jobId: string;
         };
       };
+      startErroredToolCallSummary: {
+        params: {
+          sessionFilePaths: string[];
+        };
+        response: {
+          jobId: string;
+        };
+      };
       getExportJobStatus: {
         params: {
           jobId: string;
@@ -198,6 +232,12 @@ export type CodexerRPC = {
         };
         response: TokenUsageSummaryJobStatus;
       };
+      getErroredToolCallSummaryJobStatus: {
+        params: {
+          jobId: string;
+        };
+        response: ErroredToolCallSummaryJobStatus;
+      };
       cancelExportJob: {
         params: {
           jobId: string;
@@ -220,6 +260,23 @@ export type CodexerRPC = {
         };
         response: {
           ok: boolean;
+        };
+      };
+      cancelErroredToolCallSummaryJob: {
+        params: {
+          jobId: string;
+        };
+        response: {
+          ok: boolean;
+        };
+      };
+      saveMarkdownFile: {
+        params: {
+          content: string;
+          suggestedFileName: string;
+        };
+        response: {
+          outputPath: string | null;
         };
       };
       revealPath: {

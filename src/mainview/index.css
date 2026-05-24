@@ -1142,6 +1142,76 @@ code,
   overflow-wrap: anywhere;
 }
 
+.tool-error-list {
+  display: grid;
+  gap: 0.75rem;
+  max-height: min(42vh, 460px);
+  overflow: auto;
+  padding-right: 0.2rem;
+}
+
+.tool-error-card {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.9rem;
+  border: 1px solid rgba(99, 82, 58, 0.14);
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.66);
+}
+
+.tool-error-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.tool-error-card-header div {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.tool-error-card-header strong,
+.tool-error-pattern {
+  overflow-wrap: anywhere;
+}
+
+.tool-error-card-header span,
+.tool-error-meta {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.tool-error-pattern {
+  margin: 0;
+  color: var(--color-secondary);
+  font-weight: 700;
+}
+
+.tool-error-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.tool-error-card pre {
+  margin: 0;
+  max-height: 8.5rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-radius: 0.6rem;
+  background: rgba(250, 247, 241, 0.82);
+  padding: 0.7rem;
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
 .token-usage-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1167,6 +1237,12 @@ code,
 .token-copy-button {
   display: inline-flex;
   align-items: center;
+  gap: 0.5rem;
+}
+
+.summary-output-actions {
+  display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
 }
 

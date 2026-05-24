@@ -67,6 +67,26 @@ export type SessionTokenUsage = {
   totalTokens: number;
 };
 
+export type SessionErroredToolCallPattern = {
+  toolName: string;
+  callKind: "function" | "custom";
+  inputFingerprint: string;
+  argumentsPreview: string;
+  errorPattern: string;
+  errorKind: string;
+  exitCode: number | null;
+  occurrences: number;
+  sessionCount: number;
+  firstTimestamp: string | null;
+  lastTimestamp: string | null;
+  sampleOutput: string;
+};
+
+type ErroredToolCallPatternKeyParts = Pick<
+  SessionErroredToolCallPattern,
+  "callKind" | "toolName" | "inputFingerprint" | "errorKind" | "errorPattern"
+>;
+
 export type SessionTokenUsageScanProgress = {
   bytesProcessed: number;
   fileSizeBytes: number;
@@ -82,6 +102,25 @@ export type ReadSessionTokenUsageResult = {
   fileSizeBytes: number;
   oversizedLineCount: number;
   tokenCountRows: number;
+};
+
+export type SessionErroredToolCallScanProgress = {
+  bytesProcessed: number;
+  fileSizeBytes: number;
+};
+
+export type ReadSessionErroredToolCallsOptions = {
+  signal?: AbortSignal;
+  onProgress?: (progress: SessionErroredToolCallScanProgress) => void | Promise<void>;
+};
+
+export type ReadSessionErroredToolCallsResult = {
+  fileSizeBytes: number;
+  oversizedLineCount: number;
+  toolCallRows: number;
+  toolOutputRows: number;
+  erroredToolCallCount: number;
+  distinctErroredToolCalls: SessionErroredToolCallPattern[];
 };
 
 export type SessionDetailMetricsOptions = {
@@ -320,6 +359,10 @@ export const MAX_JSONL_LINE_BYTES_HARD = 32 * 1024 * 1024;
 export const EXPORT_MAX_JSONL_LINE_BYTES = 128 * 1024 * 1024;
 const EXPORT_PROGRESS_PULSE_BYTES = 4 * 1024 * 1024;
 const TOKEN_COUNT_LINE_NEEDLE = Buffer.from('"token_count"', "utf8");
+const RESPONSE_ITEM_LINE_NEEDLE = Buffer.from('"response_item"', "utf8");
+const MAX_TOOL_ARGUMENT_PREVIEW_LENGTH = 320;
+const MAX_TOOL_OUTPUT_PREVIEW_LENGTH = 700;
+const MAX_TOOL_ERROR_PATTERN_LENGTH = 220;
 const WINDOWS_PATH_CANDIDATE_REGEX =
   /(?:\\\\\?\\)?[a-zA-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*/g;
 const WSL_UNC_PATH_CANDIDATE_REGEX =
@@ -1001,6 +1044,153 @@ export async function readSessionTokenUsage(
   };
 }
 
+type PendingToolCall = {
+  callId: string | null;
+  toolName: string;
+  callKind: "function" | "custom";
+  input: unknown;
+  inputKey: string;
+  inputPreview: string;
+  timestamp: string | null;
+};
+
+type ToolOutputFailure = {
+  errorKind: string;
+  errorPattern: string;
+  exitCode: number | null;
+  sampleOutput: string;
+};
+
+export async function readSessionErroredToolCalls(
+  inputPath: string,
+  options: ReadSessionErroredToolCallsOptions = {},
+): Promise<ReadSessionErroredToolCallsResult> {
+  const sessionFilePath = resolveFilesystemPath(inputPath);
+  let fileSizeBytes = 0;
+  try {
+    fileSizeBytes = (await fs.stat(sessionFilePath)).size;
+  } catch {
+    throw new Error(`Session file not found: ${sessionFilePath}`);
+  }
+
+  const pendingToolCalls = new Map<string, PendingToolCall>();
+  let lastUnmatchedToolCall: PendingToolCall | null = null;
+  const erroredToolCallPatterns = new Map<string, SessionErroredToolCallPattern>();
+  let oversizedLineCount = 0;
+  let toolCallRows = 0;
+  let toolOutputRows = 0;
+  let erroredToolCallCount = 0;
+  let lastProgressBytes = 0;
+
+  for await (const event of streamJsonlLines(sessionFilePath, {
+    signal: options.signal,
+    maxLineBytes: MAX_JSONL_LINE_BYTES_HARD,
+    oversizedStrategy: "emit",
+    requiredLineContent: RESPONSE_ITEM_LINE_NEEDLE,
+  })) {
+    if (event.kind === "oversized") {
+      oversizedLineCount += 1;
+      lastProgressBytes = await maybeReportErroredToolCallScanProgress(
+        options,
+        event.bytesProcessed,
+        fileSizeBytes,
+        lastProgressBytes,
+      );
+      continue;
+    }
+
+    if (event.kind === "skipped") {
+      lastProgressBytes = await maybeReportErroredToolCallScanProgress(
+        options,
+        event.bytesProcessed,
+        fileSizeBytes,
+        lastProgressBytes,
+      );
+      continue;
+    }
+
+    try {
+      const record = JSON.parse(event.line.trim()) as JsonlRecord;
+      if (record.type !== "response_item") {
+        continue;
+      }
+
+      const item = asObject(record.payload);
+      if (!item || typeof item.type !== "string") {
+        continue;
+      }
+
+      const timestamp = typeof record.timestamp === "string" ? record.timestamp : null;
+      if (item.type === "function_call" || item.type === "custom_tool_call") {
+        const toolCall = buildPendingToolCall(item, timestamp);
+        toolCallRows += 1;
+        if (toolCall.callId) {
+          pendingToolCalls.set(toolCall.callId, toolCall);
+        } else {
+          lastUnmatchedToolCall = toolCall;
+        }
+        continue;
+      }
+
+      if (item.type !== "function_call_output" && item.type !== "custom_tool_call_output") {
+        continue;
+      }
+
+      toolOutputRows += 1;
+      const failure = classifyToolOutputFailure(item.output);
+      if (!failure) {
+        continue;
+      }
+
+      const callId = typeof item.call_id === "string" ? item.call_id : null;
+      const toolCall = callId ? pendingToolCalls.get(callId) ?? null : lastUnmatchedToolCall;
+      if (callId) {
+        pendingToolCalls.delete(callId);
+      } else {
+        lastUnmatchedToolCall = null;
+      }
+
+      const fallbackKind = item.type === "custom_tool_call_output" ? "custom" : "function";
+      const normalizedToolCall =
+        toolCall ??
+        buildUnknownToolCall(callId, fallbackKind, timestamp);
+
+      erroredToolCallCount += 1;
+      addErroredToolCallPattern(
+        erroredToolCallPatterns,
+        normalizedToolCall,
+        failure,
+        timestamp,
+      );
+    } catch {
+      // Ignore malformed response-item candidates so one bad row does not block a summary.
+    }
+
+    lastProgressBytes = await maybeReportErroredToolCallScanProgress(
+      options,
+      event.bytesProcessed,
+      fileSizeBytes,
+      lastProgressBytes,
+    );
+  }
+
+  await options.onProgress?.({
+    bytesProcessed: fileSizeBytes,
+    fileSizeBytes,
+  });
+
+  return {
+    fileSizeBytes,
+    oversizedLineCount,
+    toolCallRows,
+    toolOutputRows,
+    erroredToolCallCount,
+    distinctErroredToolCalls: sortErroredToolCallPatterns([
+      ...erroredToolCallPatterns.values(),
+    ]),
+  };
+}
+
 export async function readSessionTranscript(
   inputPath: string,
   options: ReadSessionTranscriptOptions = {},
@@ -1665,6 +1855,390 @@ async function maybeReportTokenScanProgress(
   await yieldForExportLoop();
 
   return bytesProcessed;
+}
+
+async function maybeReportErroredToolCallScanProgress(
+  options: ReadSessionErroredToolCallsOptions,
+  bytesProcessed: number,
+  fileSizeBytes: number,
+  lastProgressBytes: number,
+): Promise<number> {
+  if (
+    !options.onProgress ||
+    (bytesProcessed !== fileSizeBytes &&
+      bytesProcessed - lastProgressBytes < EXPORT_PROGRESS_PULSE_BYTES)
+  ) {
+    return lastProgressBytes;
+  }
+
+  throwIfExportCancelled(options.signal);
+  await options.onProgress({
+    bytesProcessed,
+    fileSizeBytes,
+  });
+  throwIfExportCancelled(options.signal);
+  await yieldForExportLoop();
+
+  return bytesProcessed;
+}
+
+function buildPendingToolCall(
+  item: Record<string, unknown>,
+  timestamp: string | null,
+): PendingToolCall {
+  const callId = typeof item.call_id === "string" ? item.call_id : null;
+  const toolName = typeof item.name === "string" ? item.name : "unknown-tool";
+  const callKind = item.type === "custom_tool_call" ? "custom" : "function";
+  const input = callKind === "custom" ? item.input : item.arguments;
+  return {
+    callId,
+    toolName,
+    callKind,
+    input,
+    inputKey: normalizeToolInputForPattern(input),
+    inputPreview: truncateText(prettyStructuredText(input), MAX_TOOL_ARGUMENT_PREVIEW_LENGTH),
+    timestamp,
+  };
+}
+
+function buildUnknownToolCall(
+  callId: string | null,
+  callKind: "function" | "custom",
+  timestamp: string | null,
+): PendingToolCall {
+  const input = callId ? `call_id:${callId}` : "";
+  return {
+    callId,
+    toolName: "unknown-tool",
+    callKind,
+    input,
+    inputKey: input,
+    inputPreview: input,
+    timestamp,
+  };
+}
+
+function addErroredToolCallPattern(
+  patterns: Map<string, SessionErroredToolCallPattern>,
+  toolCall: PendingToolCall,
+  failure: ToolOutputFailure,
+  outputTimestamp: string | null,
+): void {
+  const key = getErroredToolCallPatternKey({
+    callKind: toolCall.callKind,
+    toolName: toolCall.toolName,
+    inputFingerprint: toolCall.inputKey,
+    errorKind: failure.errorKind,
+    errorPattern: failure.errorPattern,
+  });
+  const timestamp = outputTimestamp ?? toolCall.timestamp;
+  const existing = patterns.get(key);
+  if (existing) {
+    existing.occurrences += 1;
+    existing.firstTimestamp = earlierTimestamp(existing.firstTimestamp, timestamp);
+    existing.lastTimestamp = laterTimestamp(existing.lastTimestamp, timestamp);
+    return;
+  }
+
+  patterns.set(key, {
+    toolName: toolCall.toolName,
+    callKind: toolCall.callKind,
+    inputFingerprint: toolCall.inputKey,
+    argumentsPreview: toolCall.inputPreview,
+    errorPattern: failure.errorPattern,
+    errorKind: failure.errorKind,
+    exitCode: failure.exitCode,
+    occurrences: 1,
+    sessionCount: 1,
+    firstTimestamp: timestamp,
+    lastTimestamp: timestamp,
+    sampleOutput: failure.sampleOutput,
+  });
+}
+
+export function getErroredToolCallPatternKey(
+  pattern: ErroredToolCallPatternKeyParts,
+): string {
+  return JSON.stringify([
+    pattern.callKind,
+    pattern.toolName,
+    pattern.inputFingerprint,
+    pattern.errorKind,
+    pattern.errorPattern,
+  ]);
+}
+
+export function mergeErroredToolCallPatterns(
+  patterns: Iterable<SessionErroredToolCallPattern>,
+): SessionErroredToolCallPattern[] {
+  const mergedPatterns = new Map<string, SessionErroredToolCallPattern>();
+
+  for (const pattern of patterns) {
+    const key = getErroredToolCallPatternKey(pattern);
+    const existing = mergedPatterns.get(key);
+    if (!existing) {
+      mergedPatterns.set(key, { ...pattern });
+      continue;
+    }
+
+    existing.occurrences += pattern.occurrences;
+    existing.sessionCount += pattern.sessionCount;
+    existing.firstTimestamp = earlierTimestamp(existing.firstTimestamp, pattern.firstTimestamp);
+    existing.lastTimestamp = laterTimestamp(existing.lastTimestamp, pattern.lastTimestamp);
+  }
+
+  return sortErroredToolCallPatterns([...mergedPatterns.values()]);
+}
+
+export function sortErroredToolCallPatterns(
+  patterns: SessionErroredToolCallPattern[],
+): SessionErroredToolCallPattern[] {
+  return patterns.sort((left, right) => {
+    const occurrenceDelta = right.occurrences - left.occurrences;
+    if (occurrenceDelta !== 0) {
+      return occurrenceDelta;
+    }
+
+    const sessionDelta = right.sessionCount - left.sessionCount;
+    if (sessionDelta !== 0) {
+      return sessionDelta;
+    }
+
+    const toolDelta = left.toolName.localeCompare(right.toolName);
+    if (toolDelta !== 0) {
+      return toolDelta;
+    }
+
+    return left.errorPattern.localeCompare(right.errorPattern);
+  });
+}
+
+function earlierTimestamp(left: string | null, right: string | null): string | null {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+
+  return Date.parse(right) < Date.parse(left) ? right : left;
+}
+
+function laterTimestamp(left: string | null, right: string | null): string | null {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+
+  return Date.parse(right) > Date.parse(left) ? right : left;
+}
+
+function classifyToolOutputFailure(output: unknown): ToolOutputFailure | null {
+  const parsedOutput = parseNestedJsonValue(output);
+  const parsedObject = asObject(parsedOutput);
+  const metadata = asObject(parsedObject?.metadata);
+  const exitCode =
+    asInteger(metadata?.exit_code) ??
+    asInteger(metadata?.exitCode) ??
+    asInteger(parsedObject?.exit_code) ??
+    asInteger(parsedObject?.exitCode);
+  const status = asStatusString(parsedObject?.status ?? metadata?.status);
+  const success = parsedObject?.success;
+  const explicitError = extractExplicitErrorText(parsedObject);
+  const outputText = extractToolOutputText(parsedOutput);
+  const sampleOutput = truncateText(outputText, MAX_TOOL_OUTPUT_PREVIEW_LENGTH);
+  const hasExplicitSuccessSignal =
+    exitCode === 0 ||
+    status === "success" ||
+    status === "completed" ||
+    success === true;
+
+  if (exitCode !== null && exitCode !== 0) {
+    const textPattern = extractErrorTextPattern(outputText);
+    return {
+      errorKind: "exit_code",
+      errorPattern: textPattern
+        ? truncateText(`exit ${exitCode}: ${textPattern}`, MAX_TOOL_ERROR_PATTERN_LENGTH)
+        : `exit ${exitCode}`,
+      exitCode,
+      sampleOutput,
+    };
+  }
+
+  if (status === "error" || status === "failed" || status === "failure") {
+    const textPattern = extractErrorTextPattern(outputText);
+    return {
+      errorKind: "failed_status",
+      errorPattern: textPattern
+        ? truncateText(textPattern, MAX_TOOL_ERROR_PATTERN_LENGTH)
+        : `status ${status}`,
+      exitCode,
+      sampleOutput,
+    };
+  }
+
+  if (success === false) {
+    const textPattern = extractErrorTextPattern(outputText);
+    return {
+      errorKind: "success_false",
+      errorPattern: textPattern
+        ? truncateText(textPattern, MAX_TOOL_ERROR_PATTERN_LENGTH)
+        : "success false",
+      exitCode,
+      sampleOutput,
+    };
+  }
+
+  if (hasExplicitSuccessSignal) {
+    return null;
+  }
+
+  if (explicitError) {
+    return {
+      errorKind: "explicit_error",
+      errorPattern: truncateText(
+        normalizeErrorPattern(explicitError),
+        MAX_TOOL_ERROR_PATTERN_LENGTH,
+      ),
+      exitCode,
+      sampleOutput,
+    };
+  }
+
+  const textPattern = extractErrorTextPattern(outputText);
+  if (textPattern) {
+    return {
+      errorKind: "error_text",
+      errorPattern: truncateText(textPattern, MAX_TOOL_ERROR_PATTERN_LENGTH),
+      exitCode,
+      sampleOutput,
+    };
+  }
+
+  return null;
+}
+
+function parseNestedJsonValue(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) {
+    return value;
+  }
+
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return value;
+  }
+}
+
+function extractExplicitErrorText(value: Record<string, unknown> | null): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const candidates = [value.error, value.errorMessage];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate;
+    }
+
+    const candidateObject = asObject(candidate);
+    if (candidateObject) {
+      const nestedMessage = candidateObject.message;
+      if (typeof nestedMessage === "string" && nestedMessage.trim()) {
+        return nestedMessage;
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractToolOutputText(value: unknown): string {
+  const objectValue = asObject(value);
+  if (objectValue && "output" in objectValue) {
+    return prettyStructuredText(objectValue.output);
+  }
+
+  return prettyStructuredText(value);
+}
+
+function extractErrorTextPattern(text: string): string | null {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const errorLine = lines.find((line) =>
+    /(?:^|\b)(?:error|exception|traceback|parsererror|syntaxerror|typeerror|referenceerror|enoent|eacces|command failed|process exited with code|exit code|invalid parameters?|invalid arguments?|invalid options?|unrecognized options?|unknown options?|unexpected arguments?|missing required arguments?|parameter cannot be found)\b/i.test(
+      line,
+    ),
+  );
+
+  if (!errorLine) {
+    return null;
+  }
+
+  return normalizeErrorPattern(errorLine);
+}
+
+function normalizeErrorPattern(value: string): string {
+  return value
+    .replace(WINDOWS_PATH_CANDIDATE_REGEX, "<path>")
+    .replace(WSL_UNC_PATH_CANDIDATE_REGEX, "<path>")
+    .replace(WSL_MOUNT_PATH_CANDIDATE_REGEX, "<path>")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi, "<id>")
+    .replace(/\bline\s+\d+\b/gi, "line <n>")
+    .replace(/:\d+:\d+\b/g, ":<n>:<n>")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeToolInputForPattern(value: unknown): string {
+  const parsedValue = parseNestedJsonValue(value);
+  if (typeof parsedValue === "string") {
+    return parsedValue.replace(/\s+/g, " ").trim();
+  }
+
+  return JSON.stringify(sortJsonValue(parsedValue));
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortJsonValue);
+  }
+
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const sortedEntries = Object.entries(value as Record<string, unknown>)
+    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+    .map(([key, childValue]) => [key, sortJsonValue(childValue)] as const);
+  return Object.fromEntries(sortedEntries);
+}
+
+function asInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.trunc(value)
+    : null;
+}
+
+function asStatusString(value: unknown): string | null {
+  return typeof value === "string" ? value.trim().toLowerCase() : null;
+}
+
+function truncateText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
 function buildHtmlExportPrefix(

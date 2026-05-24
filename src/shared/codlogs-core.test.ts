@@ -8,7 +8,10 @@ import {
   exportSessionJsonlToMarkdown,
   findCodexSessions,
   getSessionDetailMetrics,
+  mergeErroredToolCallPatterns,
+  readSessionErroredToolCalls,
   readSessionTokenUsage,
+  type SessionErroredToolCallPattern,
 } from "./codlogs-core.ts";
 import {
   buildCodexCurrentDayRolloutPath,
@@ -292,6 +295,382 @@ describe("large-session hardening", () => {
       totalTokens: 112,
     });
     expect(progressEvents.at(-1)).toBe(result.fileSizeBytes);
+  });
+
+  test("groups errored tool calls by tool input and normalized error pattern", async () => {
+    const tempDir = await createTempDir("codlogs-tool-error-scan-");
+    const sessionPath = path.join(tempDir, "tool-errors.jsonl");
+    const makeResponseItem = (payload: Record<string, unknown>, timestamp: string) =>
+      JSON.stringify({
+        type: "response_item",
+        payload,
+        timestamp,
+      });
+
+    const firstCall = makeResponseItem(
+      {
+        type: "function_call",
+        call_id: "call_1",
+        name: "functions.exec_command",
+        arguments: JSON.stringify({ cmd: "rg missing src", shell: "pwsh" }),
+      },
+      "2026-03-14T12:00:00.000Z",
+    );
+    const firstOutput = makeResponseItem(
+      {
+        type: "function_call_output",
+        call_id: "call_1",
+        output: JSON.stringify({
+          output: "ParserError: Unexpected token at D:\\github\\codlogs\\src\\file.ts:12:3",
+          metadata: { exit_code: 1, duration_seconds: 0.5 },
+        }),
+      },
+      "2026-03-14T12:00:03.000Z",
+    );
+    const secondCall = makeResponseItem(
+      {
+        type: "function_call",
+        call_id: "call_2",
+        name: "functions.exec_command",
+        arguments: JSON.stringify({ shell: "pwsh", cmd: "rg missing src" }),
+      },
+      "2026-03-14T12:01:00.000Z",
+    );
+    const secondOutput = makeResponseItem(
+      {
+        type: "function_call_output",
+        call_id: "call_2",
+        output: JSON.stringify({
+          output: "ParserError: Unexpected token at D:\\github\\codlogs\\src\\other.ts:99:7",
+          metadata: { exit_code: 1, duration_seconds: 0.4 },
+        }),
+      },
+      "2026-03-14T12:01:03.000Z",
+    );
+    const successCall = makeResponseItem(
+      {
+        type: "function_call",
+        call_id: "call_3",
+        name: "functions.exec_command",
+        arguments: JSON.stringify({ cmd: "rg present src", shell: "pwsh" }),
+      },
+      "2026-03-14T12:02:00.000Z",
+    );
+    const successOutput = makeResponseItem(
+      {
+        type: "function_call_output",
+        call_id: "call_3",
+        output: JSON.stringify({
+          output: "src\\file.ts:1:present",
+          metadata: { exit_code: 0, duration_seconds: 0.2 },
+        }),
+      },
+      "2026-03-14T12:02:03.000Z",
+    );
+
+    await fs.writeFile(
+      sessionPath,
+      `${firstCall}\n${firstOutput}\n${secondCall}\n${secondOutput}\n${successCall}\n${successOutput}\n`,
+    );
+
+    const progressEvents: number[] = [];
+    const result = await readSessionErroredToolCalls(sessionPath, {
+      onProgress: (progress) => {
+        progressEvents.push(progress.bytesProcessed);
+      },
+    });
+
+    expect(result.toolCallRows).toBe(3);
+    expect(result.toolOutputRows).toBe(3);
+    expect(result.erroredToolCallCount).toBe(2);
+    expect(result.distinctErroredToolCalls).toHaveLength(1);
+    expect(result.distinctErroredToolCalls[0]).toMatchObject({
+      toolName: "functions.exec_command",
+      callKind: "function",
+      inputFingerprint: JSON.stringify({ cmd: "rg missing src", shell: "pwsh" }),
+      errorKind: "exit_code",
+      exitCode: 1,
+      occurrences: 2,
+      sessionCount: 1,
+      firstTimestamp: "2026-03-14T12:00:03.000Z",
+      lastTimestamp: "2026-03-14T12:01:03.000Z",
+    });
+    expect(result.distinctErroredToolCalls[0]?.argumentsPreview).toContain("rg missing src");
+    expect(result.distinctErroredToolCalls[0]?.errorPattern).toBe(
+      "exit 1: ParserError: Unexpected token at <path>:<n>:<n>",
+    );
+    expect(progressEvents.at(-1)).toBe(result.fileSizeBytes);
+  });
+
+  test("detects custom tool failures from explicit error objects", async () => {
+    const tempDir = await createTempDir("codlogs-custom-tool-error-");
+    const sessionPath = path.join(tempDir, "custom-tool-error.jsonl");
+    const customCall = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call",
+        call_id: "custom_1",
+        name: "imagegen",
+        input: "make a chart",
+      },
+      timestamp: "2026-03-14T12:00:00.000Z",
+    });
+    const customOutput = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call_output",
+        call_id: "custom_1",
+        output: {
+          error: { message: "Remote renderer failed for request abc123" },
+        },
+      },
+      timestamp: "2026-03-14T12:00:04.000Z",
+    });
+
+    await fs.writeFile(sessionPath, `${customCall}\n${customOutput}\n`);
+
+    const result = await readSessionErroredToolCalls(sessionPath);
+
+    expect(result.erroredToolCallCount).toBe(1);
+    expect(result.distinctErroredToolCalls).toEqual([
+      {
+        toolName: "imagegen",
+        callKind: "custom",
+        inputFingerprint: "make a chart",
+        argumentsPreview: "make a chart",
+        errorPattern: "Remote renderer failed for request abc123",
+        errorKind: "explicit_error",
+        exitCode: null,
+        occurrences: 1,
+        sessionCount: 1,
+        firstTimestamp: "2026-03-14T12:00:04.000Z",
+        lastTimestamp: "2026-03-14T12:00:04.000Z",
+        sampleOutput: JSON.stringify(
+          {
+            error: { message: "Remote renderer failed for request abc123" },
+          },
+          null,
+          2,
+        ),
+      },
+    ]);
+  });
+
+  test("does not treat successful tool messages as errors", async () => {
+    const tempDir = await createTempDir("codlogs-tool-message-success-");
+    const sessionPath = path.join(tempDir, "tool-message-success.jsonl");
+    const call = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        call_id: "call_success",
+        name: "functions.exec_command",
+        arguments: JSON.stringify({ cmd: "echo ok" }),
+      },
+    });
+    const output = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "call_success",
+        output: {
+          message: "completed",
+          status: "success",
+        },
+      },
+    });
+
+    await fs.writeFile(sessionPath, `${call}\n${output}\n`);
+
+    const result = await readSessionErroredToolCalls(sessionPath);
+
+    expect(result.erroredToolCallCount).toBe(0);
+    expect(result.distinctErroredToolCalls).toEqual([]);
+  });
+
+  test("does not let fallback error text override explicit success signals", async () => {
+    const tempDir = await createTempDir("codlogs-tool-explicit-success-");
+    const sessionPath = path.join(tempDir, "tool-explicit-success.jsonl");
+    const rows: string[] = [];
+    const cases = [
+      {
+        callId: "call_zero_errors",
+        output: {
+          status: "completed",
+          output: "Tests passed with 0 errors.",
+        },
+      },
+      {
+        callId: "call_no_errors",
+        output: {
+          success: true,
+          output: "No errors found.",
+        },
+      },
+      {
+        callId: "call_exit_zero_stderr",
+        output: {
+          exit_code: 0,
+          stderr: "error: benign diagnostic emitted by a successful command",
+          stdout: "ok",
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      rows.push(
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            call_id: testCase.callId,
+            name: "functions.exec_command",
+            arguments: JSON.stringify({ cmd: "test command" }),
+          },
+        }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "function_call_output",
+            call_id: testCase.callId,
+            output: testCase.output,
+          },
+        }),
+      );
+    }
+
+    await fs.writeFile(sessionPath, `${rows.join("\n")}\n`);
+
+    const result = await readSessionErroredToolCalls(sessionPath);
+
+    expect(result.erroredToolCallCount).toBe(0);
+    expect(result.distinctErroredToolCalls).toEqual([]);
+  });
+
+  test("detects locale-neutral command-construction fallback signatures", async () => {
+    const tempDir = await createTempDir("codlogs-command-fallback-errors-");
+    const sessionPath = path.join(tempDir, "command-fallback-errors.jsonl");
+    const rows: string[] = [];
+    const cases = [
+      {
+        callId: "missing_path_os_error",
+        output: "tool-name: missing path (os error 2)",
+      },
+      {
+        callId: "bad_path_os_error",
+        output: "tool-name: invalid path syntax (os error 123)",
+      },
+      {
+        callId: "powershell_parser_error",
+        output:
+          "ParserError:\nLine |\n   1 | foreach ($item in @(1)) { [pscustomobject]@{ Item = $item } } | Format-Table -AutoSize\n     |                                                                ~\n     | An empty pipe element is not allowed.",
+      },
+      {
+        callId: "literal_home_path",
+        output:
+          "MethodInvocationException: Exception calling \"ReadAllBytes\" with \"1\" argument(s): \"Could not find a part of the path 'D:\\github\\codlogs\\$HOME\\.codex\\AGENTS.md'.\"",
+      },
+      {
+        callId: "invalid_parameters",
+        output: "Invalid parameters: expected exactly one search pattern.",
+      },
+    ];
+
+    for (const testCase of cases) {
+      rows.push(
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            call_id: testCase.callId,
+            name: "functions.exec_command",
+            arguments: JSON.stringify({ cmd: testCase.callId }),
+          },
+        }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "function_call_output",
+            call_id: testCase.callId,
+            output: testCase.output,
+          },
+        }),
+      );
+    }
+
+    await fs.writeFile(sessionPath, `${rows.join("\n")}\n`);
+
+    const result = await readSessionErroredToolCalls(sessionPath);
+
+    expect(result.erroredToolCallCount).toBe(cases.length);
+    expect(result.distinctErroredToolCalls).toHaveLength(cases.length);
+    const errorPatterns = result.distinctErroredToolCalls.map(
+      (pattern) => pattern.errorPattern,
+    );
+    expect(errorPatterns).toContain("tool-name: missing path (os error 2)");
+    expect(errorPatterns).toContain("tool-name: invalid path syntax (os error 123)");
+    expect(errorPatterns).toContain("ParserError:");
+    expect(
+      errorPatterns.some((pattern) =>
+        pattern.startsWith(
+          "MethodInvocationException: Exception calling \"ReadAllBytes\"",
+        ),
+      ),
+    ).toBe(true);
+    expect(errorPatterns).toContain(
+      "Invalid parameters: expected exactly one search pattern.",
+    );
+  });
+
+  test("merges repeated errored tool call patterns across sessions", () => {
+    const firstPattern: SessionErroredToolCallPattern = {
+      toolName: "functions.exec_command",
+      callKind: "function",
+      inputFingerprint: "{\"cmd\":\"bun test\"}",
+      argumentsPreview: "{\"cmd\":\"bun test\"}",
+      errorPattern: "exit 1: expected failure",
+      errorKind: "exit_code",
+      exitCode: 1,
+      occurrences: 2,
+      sessionCount: 1,
+      firstTimestamp: "2026-03-14T12:00:00.000Z",
+      lastTimestamp: "2026-03-14T12:05:00.000Z",
+      sampleOutput: "expected failure",
+    };
+    const secondPattern: SessionErroredToolCallPattern = {
+      ...firstPattern,
+      occurrences: 1,
+      sessionCount: 1,
+      firstTimestamp: "2026-03-14T11:59:00.000Z",
+      lastTimestamp: "2026-03-14T12:06:00.000Z",
+      sampleOutput: "same pattern in another session",
+    };
+    const otherPattern: SessionErroredToolCallPattern = {
+      ...firstPattern,
+      inputFingerprint: "{\"cmd\":\"bun x tsc --noEmit\"}",
+      argumentsPreview: "{\"cmd\":\"bun x tsc --noEmit\"}",
+      errorPattern: "exit 2: type error",
+      occurrences: 1,
+      firstTimestamp: "2026-03-14T12:10:00.000Z",
+      lastTimestamp: "2026-03-14T12:10:00.000Z",
+      sampleOutput: "type error",
+    };
+
+    const merged = mergeErroredToolCallPatterns([
+      firstPattern,
+      secondPattern,
+      otherPattern,
+    ]);
+
+    expect(merged).toHaveLength(2);
+    expect(merged[0]).toEqual({
+      ...firstPattern,
+      occurrences: 3,
+      sessionCount: 2,
+      firstTimestamp: "2026-03-14T11:59:00.000Z",
+      lastTimestamp: "2026-03-14T12:06:00.000Z",
+    });
+    expect(merged[1]).toEqual(otherPattern);
   });
 
   test("returns partial detail metrics when a row exceeds the bounded line limit", async () => {

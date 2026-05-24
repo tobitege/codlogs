@@ -7,9 +7,11 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactElement,
+  type ReactNode,
 } from "react";
 import type {
   FindCodexSessionsResult,
+  SessionErroredToolCallPattern,
   SessionDetailMetrics,
   SessionMetaMatch,
   SessionTokenUsage,
@@ -19,6 +21,8 @@ import type {
 import type {
   CodexerRPC,
   EnvironmentCapabilities,
+  ErroredToolCallSummaryJobStatus,
+  ErroredToolCallSummaryResult,
   TokenUsageSummaryJobStatus,
   TokenUsageSummaryResult,
 } from "../shared/rpc.ts";
@@ -71,7 +75,7 @@ type RenameDialogState = {
   title: string;
 };
 
-type TokenUsageSummaryDialogState = {
+type SummaryDialogState = {
   sessionFilePaths: string[];
   sessionCount: number;
   fileSizeBytes: number;
@@ -80,6 +84,30 @@ type TokenUsageSummaryDialogState = {
 type TokenUsageSummaryState =
   | { kind: "idle" }
   | TokenUsageSummaryJobStatus;
+
+type ErroredToolCallSummaryState =
+  | { kind: "idle" }
+  | ErroredToolCallSummaryJobStatus;
+
+type SummaryJobStatusBase<TResult> = {
+  kind: "working" | "success" | "error" | "cancelled";
+  progressPercent: number;
+  stage: string;
+  message: string;
+  scannedSessionCount: number;
+  totalSessionCount: number;
+  currentSessionPath: string | null;
+  result: TResult | null;
+};
+
+type SummaryJobState<TStatus extends SummaryJobStatusBase<unknown>> =
+  | { kind: "idle" }
+  | TStatus;
+
+type SummarySessionSource = {
+  file: string;
+  fileSizeBytes: number;
+};
 
 type SessionBrowserState =
   | { kind: "idle" }
@@ -225,6 +253,21 @@ function getUncachedInputTokens(tokenUsage: SessionTokenUsage): number {
   return Math.max(0, tokenUsage.inputTokens - tokenUsage.cachedInputTokens);
 }
 
+type SummaryTextField = {
+  label: string;
+  value: string;
+};
+
+type ErroredToolCallSummarySections = {
+  totals: SummaryTextField[];
+  patterns: Array<{
+    title: string;
+    fields: SummaryTextField[];
+    input: string;
+    sampleOutput: string;
+  }>;
+};
+
 function formatTokenUsageForClipboard(
   sessionTitle: string,
   tokenUsage: SessionTokenUsage,
@@ -260,6 +303,139 @@ function formatTokenUsageSummaryForClipboard(
     `Output tokens: ${summary.tokenUsage.outputTokens}`,
     `Reasoning output tokens: ${summary.tokenUsage.reasoningOutputTokens}`,
   ].join("\n");
+}
+
+function buildErroredToolCallSummarySections(
+  summary: ErroredToolCallSummaryResult,
+): ErroredToolCallSummarySections {
+  return {
+    totals: [
+      { label: "Sessions scanned", value: `${summary.scannedSessionCount} / ${summary.sessionCount}` },
+      {
+        label: "Sessions with errored tool calls",
+        value: String(summary.sessionsWithErroredToolCalls),
+      },
+      {
+        label: "Sessions without errored tool calls",
+        value: String(summary.sessionsWithoutErroredToolCalls),
+      },
+      { label: "Failed sessions", value: String(summary.failedSessionCount) },
+      { label: "Errored tool calls", value: String(summary.erroredToolCallCount) },
+      {
+        label: "Distinct errored tool calls",
+        value: String(summary.distinctErroredToolCalls.length),
+      },
+      { label: "Tool call rows", value: String(summary.toolCallRows) },
+      { label: "Tool output rows", value: String(summary.toolOutputRows) },
+      { label: "Oversized JSONL rows", value: String(summary.oversizedLineCount) },
+    ],
+    patterns: summary.distinctErroredToolCalls.map((pattern) => ({
+      title: pattern.toolName,
+      fields: [
+        { label: "Kind", value: pattern.callKind },
+        { label: "Occurrences", value: String(pattern.occurrences) },
+        { label: "Sessions", value: String(pattern.sessionCount) },
+        { label: "Error kind", value: pattern.errorKind },
+        { label: "Exit code", value: String(pattern.exitCode ?? "n/a") },
+        { label: "First seen", value: pattern.firstTimestamp ?? "unknown" },
+        { label: "Last seen", value: pattern.lastTimestamp ?? "unknown" },
+        { label: "Error", value: pattern.errorPattern },
+      ],
+      input: pattern.argumentsPreview || "(empty)",
+      sampleOutput: pattern.sampleOutput || "(empty)",
+    })),
+  };
+}
+
+function formatErroredToolCallSummaryForClipboard(
+  summary: ErroredToolCallSummaryResult,
+): string {
+  const sections = buildErroredToolCallSummarySections(summary);
+  const lines = ["Filtered sessions tool error summary"];
+  for (const total of sections.totals) {
+    lines.push(`${total.label}: ${total.value}`);
+  }
+  lines.push("");
+
+  for (const pattern of sections.patterns) {
+    lines.push(
+      `${pattern.title} (${pattern.fields.find((field) => field.label === "Kind")?.value ?? "unknown"})`,
+      `Occurrences: ${pattern.fields.find((field) => field.label === "Occurrences")?.value ?? "0"}`,
+      `Sessions: ${pattern.fields.find((field) => field.label === "Sessions")?.value ?? "0"}`,
+      `Error: ${pattern.fields.find((field) => field.label === "Error")?.value ?? ""}`,
+      `Input: ${pattern.input}`,
+      `Sample output: ${pattern.sampleOutput}`,
+      "",
+    );
+  }
+
+  return lines.join("\n").trimEnd();
+}
+
+function formatMarkdownCodeBlock(value: string, language = "text"): string {
+  const content = value || "(empty)";
+  const longestFenceRun = Math.max(
+    0,
+    ...Array.from(content.matchAll(/`+/g), (match) => match[0].length),
+  );
+  const fence = "`".repeat(Math.max(3, longestFenceRun + 1));
+  return `${fence}${language}\n${content}\n${fence}`;
+}
+
+function formatErroredToolCallSummaryAsMarkdown(
+  summary: ErroredToolCallSummaryResult,
+): string {
+  const sections = buildErroredToolCallSummarySections(summary);
+  const lines = [
+    "# codlogs Tool Error Summary",
+    "",
+    "## Totals",
+    "",
+    ...sections.totals.map((total) => `- ${total.label}: ${total.value}`),
+    "",
+    "## Distinct Error Patterns",
+    "",
+  ];
+
+  if (sections.patterns.length === 0) {
+    lines.push("No errored tool calls found.", "");
+    return `${lines.join("\n").trimEnd()}\n`;
+  }
+
+  sections.patterns.forEach((pattern, index) => {
+    lines.push(
+      `### ${index + 1}. ${pattern.title}`,
+      "",
+      ...pattern.fields.map((field) => `- ${field.label}: ${field.value}`),
+      "",
+      "Input:",
+      "",
+      formatMarkdownCodeBlock(pattern.input),
+      "",
+      "Sample output:",
+      "",
+      formatMarkdownCodeBlock(pattern.sampleOutput),
+      "",
+    );
+  });
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function buildSummaryFileName(prefix: string): string {
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z").replace(/[:]/g, "-");
+  return `${prefix}-${timestamp}.md`;
+}
+
+function getSingleRepoSummaryFilePrefix(
+  result: FindCodexSessionsResult | null,
+  sessionCount: number,
+): string {
+  if (sessionCount > 0 && result?.scopeMode === "repo" && result.targetRoot) {
+    return `${basename(result.targetRoot)}-tool-error-summary`;
+  }
+
+  return "codlogs-tool-error-summary";
 }
 
 function formatInteractionSummary(
@@ -395,6 +571,197 @@ function delay(milliseconds: number): Promise<void> {
   });
 }
 
+function useSummaryJob<
+  TResult,
+  TStatus extends SummaryJobStatusBase<TResult>,
+>(options: {
+  startJob: (sessionFilePaths: string[]) => Promise<{ jobId: string }>;
+  getJobStatus: (jobId: string) => Promise<TStatus>;
+  cancelJob: (jobId: string) => Promise<{ ok: boolean }>;
+  buildStartingMessage: (sessionCount: number) => string;
+  cancellingMessage: string;
+}) {
+  const [dialog, setDialog] = useState<SummaryDialogState | null>(null);
+  const [state, setState] = useState<SummaryJobState<TStatus>>({ kind: "idle" });
+  const [cancelPending, setCancelPending] = useState(false);
+  const requestIdRef = useRef(0);
+  const activeJobIdRef = useRef<string | null>(null);
+
+  function open(sessionSources: SummarySessionSource[]): void {
+    if (sessionSources.length === 0 || state.kind === "working") {
+      return;
+    }
+
+    setState({ kind: "idle" });
+    setCancelPending(false);
+    setDialog({
+      sessionFilePaths: sessionSources.map((session) => session.file),
+      sessionCount: sessionSources.length,
+      fileSizeBytes: sessionSources.reduce(
+        (total, session) => total + session.fileSizeBytes,
+        0,
+      ),
+    });
+  }
+
+  function close(): void {
+    if (state.kind === "working") {
+      return;
+    }
+
+    requestIdRef.current += 1;
+    activeJobIdRef.current = null;
+    setCancelPending(false);
+    setDialog(null);
+    setState({ kind: "idle" });
+  }
+
+  async function start(): Promise<void> {
+    if (!dialog || state.kind === "working") {
+      return;
+    }
+
+    const requestId = requestIdRef.current + 1;
+    requestIdRef.current = requestId;
+    activeJobIdRef.current = null;
+    setCancelPending(false);
+    setState({
+      kind: "working",
+      progressPercent: 1,
+      stage: "starting",
+      message: options.buildStartingMessage(dialog.sessionCount),
+      scannedSessionCount: 0,
+      totalSessionCount: dialog.sessionCount,
+      currentSessionPath: null,
+      result: null,
+    } as TStatus);
+
+    try {
+      const { jobId } = await options.startJob(dialog.sessionFilePaths);
+      activeJobIdRef.current = jobId;
+
+      while (requestId === requestIdRef.current && activeJobIdRef.current) {
+        const activeJobId = activeJobIdRef.current;
+        if (!activeJobId) {
+          break;
+        }
+
+        const status = await options.getJobStatus(activeJobId);
+        if (requestId !== requestIdRef.current) {
+          return;
+        }
+
+        setState(status);
+        if (status.kind !== "working") {
+          activeJobIdRef.current = null;
+          setCancelPending(false);
+          return;
+        }
+
+        await delay(400);
+      }
+    } catch (summaryError) {
+      if (requestId !== requestIdRef.current) {
+        return;
+      }
+
+      activeJobIdRef.current = null;
+      setCancelPending(false);
+      setState({
+        kind: "error",
+        progressPercent: 0,
+        stage: "error",
+        message: asErrorMessage(summaryError),
+        scannedSessionCount: 0,
+        totalSessionCount: dialog.sessionCount,
+        currentSessionPath: null,
+        result: null,
+      } as TStatus);
+    }
+  }
+
+  async function cancel(): Promise<void> {
+    const jobId = activeJobIdRef.current;
+    if (!jobId || cancelPending) {
+      return;
+    }
+
+    setCancelPending(true);
+    setState((current) =>
+      current.kind === "working"
+        ? {
+            ...current,
+            message: options.cancellingMessage,
+          }
+        : current,
+    );
+
+    try {
+      await options.cancelJob(jobId);
+    } catch (cancelError) {
+      setCancelPending(false);
+      setState({
+        kind: "error",
+        progressPercent: 0,
+        stage: "error",
+        message: asErrorMessage(cancelError),
+        scannedSessionCount: 0,
+        totalSessionCount: dialog?.sessionCount ?? 0,
+        currentSessionPath: null,
+        result: null,
+      } as TStatus);
+    }
+  }
+
+  return {
+    cancel,
+    cancelPending,
+    close,
+    dialog,
+    open,
+    start,
+    state,
+  };
+}
+
+function useTimedActionState<TState extends string>(
+  initialState: TState,
+  resetDelayMs: number,
+): [TState, (state: TState) => void, (state: TState) => void] {
+  const [state, setState] = useState<TState>(initialState);
+  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (resetTimerRef.current) {
+        clearTimeout(resetTimerRef.current);
+        resetTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  function setImmediateState(nextState: TState): void {
+    if (resetTimerRef.current) {
+      clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = null;
+    }
+    setState(nextState);
+  }
+
+  function setTemporaryState(nextState: TState): void {
+    setState(nextState);
+    if (resetTimerRef.current) {
+      clearTimeout(resetTimerRef.current);
+    }
+    resetTimerRef.current = setTimeout(() => {
+      setState(initialState);
+      resetTimerRef.current = null;
+    }, resetDelayMs);
+  }
+
+  return [state, setImmediateState, setTemporaryState];
+}
+
 function formatExportLabel(format: ExportFormat): string {
   return format === "markdown" ? "Markdown" : "HTML";
 }
@@ -516,10 +883,6 @@ function App() {
   const [sanitizedCopyDialog, setSanitizedCopyDialog] =
     useState<SanitizedCopyDialogState | null>(null);
   const [showTokenUsageDialog, setShowTokenUsageDialog] = useState(false);
-  const [tokenUsageSummaryDialog, setTokenUsageSummaryDialog] =
-    useState<TokenUsageSummaryDialogState | null>(null);
-  const [tokenUsageSummaryState, setTokenUsageSummaryState] =
-    useState<TokenUsageSummaryState>({ kind: "idle" });
   const [sessionBrowser, setSessionBrowser] = useState<SessionBrowserState>({ kind: "idle" });
   const sessionBrowserRequestIdRef = useRef(0);
   const codexHomeRef = useRef(codexHome);
@@ -529,16 +892,41 @@ function App() {
   const environmentRequestIdRef = useRef(0);
   const exportRequestIdRef = useRef(0);
   const sanitizedCopyRequestIdRef = useRef(0);
-  const tokenUsageSummaryRequestIdRef = useRef(0);
   const activeExportJobIdRef = useRef<string | null>(null);
   const activeSanitizedCopyJobIdRef = useRef<string | null>(null);
-  const activeTokenUsageSummaryJobIdRef = useRef<string | null>(null);
   const initialWindowRefreshDoneRef = useRef(false);
   const [exportCancelPending, setExportCancelPending] = useState(false);
   const [sanitizedCopyCancelPending, setSanitizedCopyCancelPending] = useState(false);
-  const [tokenUsageSummaryCancelPending, setTokenUsageSummaryCancelPending] =
-    useState(false);
   const [renameSessionPending, setRenameSessionPending] = useState(false);
+
+  const tokenUsageSummaryJob = useSummaryJob<
+    TokenUsageSummaryResult,
+    TokenUsageSummaryJobStatus
+  >({
+    startJob: (sessionFilePaths) =>
+      getRpc().request.startTokenUsageSummary({ sessionFilePaths }),
+    getJobStatus: (jobId) =>
+      getRpc().request.getTokenUsageSummaryJobStatus({ jobId }),
+    cancelJob: (jobId) =>
+      getRpc().request.cancelTokenUsageSummaryJob({ jobId }),
+    buildStartingMessage: (sessionCount) =>
+      `Preparing ${sessionCount} session${sessionCount === 1 ? "" : "s"}...`,
+    cancellingMessage: "Cancelling token summary...",
+  });
+  const erroredToolCallSummaryJob = useSummaryJob<
+    ErroredToolCallSummaryResult,
+    ErroredToolCallSummaryJobStatus
+  >({
+    startJob: (sessionFilePaths) =>
+      getRpc().request.startErroredToolCallSummary({ sessionFilePaths }),
+    getJobStatus: (jobId) =>
+      getRpc().request.getErroredToolCallSummaryJobStatus({ jobId }),
+    cancelJob: (jobId) =>
+      getRpc().request.cancelErroredToolCallSummaryJob({ jobId }),
+    buildStartingMessage: (sessionCount) =>
+      `Preparing ${sessionCount} session${sessionCount === 1 ? "" : "s"}...`,
+    cancellingMessage: "Cancelling tool error summary...",
+  });
 
   const deferredSearchQuery = useDeferredValue(searchQuery);
 
@@ -1276,136 +1664,11 @@ function App() {
   }
 
   function openTokenUsageSummaryDialog(): void {
-    if (filteredSessions.length === 0 || tokenUsageSummaryState.kind === "working") {
-      return;
-    }
-
-    setTokenUsageSummaryState({ kind: "idle" });
-    setTokenUsageSummaryCancelPending(false);
-    setTokenUsageSummaryDialog({
-      sessionFilePaths: filteredSessions.map((session) => session.file),
-      sessionCount: filteredSessions.length,
-      fileSizeBytes: filteredSessions.reduce(
-        (total, session) => total + session.fileSizeBytes,
-        0,
-      ),
-    });
+    tokenUsageSummaryJob.open(filteredSessions);
   }
 
-  function closeTokenUsageSummaryDialog(): void {
-    if (tokenUsageSummaryState.kind === "working") {
-      return;
-    }
-
-    tokenUsageSummaryRequestIdRef.current += 1;
-    activeTokenUsageSummaryJobIdRef.current = null;
-    setTokenUsageSummaryCancelPending(false);
-    setTokenUsageSummaryDialog(null);
-    setTokenUsageSummaryState({ kind: "idle" });
-  }
-
-  async function startTokenUsageSummary(): Promise<void> {
-    if (!tokenUsageSummaryDialog || tokenUsageSummaryState.kind === "working") {
-      return;
-    }
-
-    const requestId = tokenUsageSummaryRequestIdRef.current + 1;
-    tokenUsageSummaryRequestIdRef.current = requestId;
-    activeTokenUsageSummaryJobIdRef.current = null;
-    setTokenUsageSummaryCancelPending(false);
-    setTokenUsageSummaryState({
-      kind: "working",
-      progressPercent: 1,
-      stage: "starting",
-      message: `Preparing ${tokenUsageSummaryDialog.sessionCount} session${tokenUsageSummaryDialog.sessionCount === 1 ? "" : "s"}...`,
-      scannedSessionCount: 0,
-      totalSessionCount: tokenUsageSummaryDialog.sessionCount,
-      currentSessionPath: null,
-      result: null,
-    });
-
-    try {
-      const { jobId } = await getRpc().request.startTokenUsageSummary({
-        sessionFilePaths: tokenUsageSummaryDialog.sessionFilePaths,
-      });
-      activeTokenUsageSummaryJobIdRef.current = jobId;
-
-      while (
-        requestId === tokenUsageSummaryRequestIdRef.current &&
-        activeTokenUsageSummaryJobIdRef.current
-      ) {
-        const activeJobId = activeTokenUsageSummaryJobIdRef.current;
-        if (!activeJobId) {
-          break;
-        }
-
-        const status = await getRpc().request.getTokenUsageSummaryJobStatus({
-          jobId: activeJobId,
-        });
-        if (requestId !== tokenUsageSummaryRequestIdRef.current) {
-          return;
-        }
-
-        setTokenUsageSummaryState(status);
-        if (status.kind !== "working") {
-          activeTokenUsageSummaryJobIdRef.current = null;
-          setTokenUsageSummaryCancelPending(false);
-          return;
-        }
-
-        await delay(400);
-      }
-    } catch (summaryError) {
-      if (requestId !== tokenUsageSummaryRequestIdRef.current) {
-        return;
-      }
-
-      activeTokenUsageSummaryJobIdRef.current = null;
-      setTokenUsageSummaryCancelPending(false);
-      setTokenUsageSummaryState({
-        kind: "error",
-        progressPercent: 0,
-        stage: "error",
-        message: asErrorMessage(summaryError),
-        scannedSessionCount: 0,
-        totalSessionCount: tokenUsageSummaryDialog.sessionCount,
-        currentSessionPath: null,
-        result: null,
-      });
-    }
-  }
-
-  async function cancelTokenUsageSummary(): Promise<void> {
-    const jobId = activeTokenUsageSummaryJobIdRef.current;
-    if (!jobId || tokenUsageSummaryCancelPending) {
-      return;
-    }
-
-    setTokenUsageSummaryCancelPending(true);
-    setTokenUsageSummaryState((current) =>
-      current.kind === "working"
-        ? {
-            ...current,
-            message: "Cancelling token summary...",
-          }
-        : current,
-    );
-
-    try {
-      await getRpc().request.cancelTokenUsageSummaryJob({ jobId });
-    } catch (cancelError) {
-      setTokenUsageSummaryCancelPending(false);
-      setTokenUsageSummaryState({
-        kind: "error",
-        progressPercent: 0,
-        stage: "error",
-        message: asErrorMessage(cancelError),
-        scannedSessionCount: 0,
-        totalSessionCount: tokenUsageSummaryDialog?.sessionCount ?? 0,
-        currentSessionPath: null,
-        result: null,
-      });
-    }
+  function openErroredToolCallSummaryDialog(): void {
+    erroredToolCallSummaryJob.open(filteredSessions);
   }
 
   async function revealPath(targetPath: string | null): Promise<void> {
@@ -1540,6 +1803,16 @@ function App() {
               type="button"
             >
               <span aria-hidden="true">Σ</span>
+            </button>
+            <button
+              aria-label="Summarize errored tool calls for filtered sessions"
+              className="hero-token-button"
+              disabled={loading || filteredSessions.length === 0}
+              onClick={openErroredToolCallSummaryDialog}
+              title="Summarize filtered session tool errors"
+              type="button"
+            >
+              <span aria-hidden="true">!</span>
             </button>
             <div className="stat-card">
               <span className="stat-label">Sessions</span>
@@ -2115,15 +2388,30 @@ function App() {
           sessionTitle={getSessionTitle(activeSession)}
         />
       )}
-      {tokenUsageSummaryDialog && (
+      {tokenUsageSummaryJob.dialog && (
         <TokenUsageSummaryDialog
-          cancelPending={tokenUsageSummaryCancelPending}
-          fileSizeBytes={tokenUsageSummaryDialog.fileSizeBytes}
-          onCancel={() => void cancelTokenUsageSummary()}
-          onClose={closeTokenUsageSummaryDialog}
-          onConfirm={() => void startTokenUsageSummary()}
-          sessionCount={tokenUsageSummaryDialog.sessionCount}
-          state={tokenUsageSummaryState}
+          cancelPending={tokenUsageSummaryJob.cancelPending}
+          fileSizeBytes={tokenUsageSummaryJob.dialog.fileSizeBytes}
+          onCancel={() => void tokenUsageSummaryJob.cancel()}
+          onClose={tokenUsageSummaryJob.close}
+          onConfirm={() => void tokenUsageSummaryJob.start()}
+          sessionCount={tokenUsageSummaryJob.dialog.sessionCount}
+          state={tokenUsageSummaryJob.state}
+        />
+      )}
+      {erroredToolCallSummaryJob.dialog && (
+        <ErroredToolCallSummaryDialog
+          cancelPending={erroredToolCallSummaryJob.cancelPending}
+          fileSizeBytes={erroredToolCallSummaryJob.dialog.fileSizeBytes}
+          onCancel={() => void erroredToolCallSummaryJob.cancel()}
+          onClose={erroredToolCallSummaryJob.close}
+          onConfirm={() => void erroredToolCallSummaryJob.start()}
+          sessionCount={erroredToolCallSummaryJob.dialog.sessionCount}
+          state={erroredToolCallSummaryJob.state}
+          suggestedFileNamePrefix={getSingleRepoSummaryFilePrefix(
+            result,
+            erroredToolCallSummaryJob.dialog.sessionCount,
+          )}
         />
       )}
       {exportState.kind === "working" && (
@@ -2329,22 +2617,36 @@ function TokenUsageDialog(props: {
   );
 }
 
-function TokenUsageSummaryDialog(props: {
+function SummaryDialogShell<TResult>(props: {
   cancelPending: boolean;
+  children: ReactNode;
   fileSizeBytes: number;
+  idleDescription: string;
+  idleMessage: string;
+  idleTitle: string;
+  kicker: string;
   onCancel: () => void;
   onClose: () => void;
   onConfirm: () => void;
+  resultActions: ReactNode;
   sessionCount: number;
-  state: TokenUsageSummaryState;
+  state: { kind: "idle" } | SummaryJobStatusBase<TResult>;
+  title: string;
+  failureTitle: string;
+  cancelledTitle: string;
 }) {
-  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
-  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const isWorking = props.state.kind === "working";
   const progressPercent =
     props.state.kind === "idle" ? 0 : Math.max(0, Math.min(100, props.state.progressPercent));
-  const result = props.state.kind === "idle" ? null : props.state.result;
+  const scannedSessionCount =
+    props.state.kind === "idle" ? 0 : props.state.scannedSessionCount;
+  const totalSessionCount =
+    props.state.kind === "idle" ? props.sessionCount : props.state.totalSessionCount;
+  const currentSessionPath =
+    props.state.kind === "working" ? props.state.currentSessionPath : null;
+  const statusMessage =
+    props.state.kind === "idle" ? props.idleMessage : props.state.message;
 
   useEffect(() => {
     dialogRef.current?.focus({ preventScroll: true });
@@ -2370,51 +2672,6 @@ function TokenUsageSummaryDialog(props: {
     };
   }, [isWorking, props.onClose]);
 
-  useEffect(() => {
-    return () => {
-      if (copyResetTimerRef.current) {
-        clearTimeout(copyResetTimerRef.current);
-        copyResetTimerRef.current = null;
-      }
-    };
-  }, []);
-
-  const handleCopy = async (): Promise<void> => {
-    if (!result) {
-      return;
-    }
-
-    let ok = false;
-    try {
-      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(formatTokenUsageSummaryForClipboard(result));
-        ok = true;
-      }
-    } catch {
-      ok = false;
-    }
-
-    setCopyState(ok ? "copied" : "failed");
-    if (copyResetTimerRef.current) {
-      clearTimeout(copyResetTimerRef.current);
-    }
-    copyResetTimerRef.current = setTimeout(() => {
-      setCopyState("idle");
-      copyResetTimerRef.current = null;
-    }, 1600);
-  };
-
-  const scannedSessionCount =
-    props.state.kind === "idle" ? 0 : props.state.scannedSessionCount;
-  const totalSessionCount =
-    props.state.kind === "idle" ? props.sessionCount : props.state.totalSessionCount;
-  const currentSessionPath =
-    props.state.kind === "working" ? props.state.currentSessionPath : null;
-  const statusMessage =
-    props.state.kind === "idle"
-      ? "Token counts are read from every currently filtered JSONL file. Large logs can take a while."
-      : props.state.message;
-
   return (
     <div
       className="dialog-backdrop"
@@ -2434,8 +2691,8 @@ function TokenUsageSummaryDialog(props: {
       >
         <div className="export-dialog-header">
           <div>
-            <span className="dialog-kicker">Filtered tokens</span>
-            <h3>Token Summary</h3>
+            <span className="dialog-kicker">{props.kicker}</span>
+            <h3>{props.title}</h3>
             <p>{statusMessage}</p>
           </div>
         </div>
@@ -2466,11 +2723,8 @@ function TokenUsageSummaryDialog(props: {
 
         {props.state.kind === "idle" && (
           <div className="dialog-warning">
-            <strong>Run token summary?</strong>
-            <p>
-              codlogs will scan the current filtered set and sum token_count totals. You can cancel
-              the scan after it starts.
-            </p>
+            <strong>{props.idleTitle}</strong>
+            <p>{props.idleDescription}</p>
           </div>
         )}
 
@@ -2481,78 +2735,19 @@ function TokenUsageSummaryDialog(props: {
           </div>
         )}
 
-        {result && (
-          <>
-            <div className="token-usage-grid">
-              <TokenUsageStat label="Total" value={result.tokenUsage.totalTokens} />
-              <TokenUsageStat label="Input" value={result.tokenUsage.inputTokens} />
-              <TokenUsageStat
-                label="Cached Input"
-                value={result.tokenUsage.cachedInputTokens}
-              />
-              <TokenUsageStat
-                label="Uncached Input"
-                value={getUncachedInputTokens(result.tokenUsage)}
-              />
-              <TokenUsageStat
-                label="Reasoning Output"
-                value={result.tokenUsage.reasoningOutputTokens}
-              />
-              <TokenUsageStat label="Output" value={result.tokenUsage.outputTokens} />
-            </div>
-            <div className="token-summary-stats">
-              <TokenSummaryStat
-                label="With Token Data"
-                value={formatTokenCount(result.sessionsWithTokenUsage)}
-              />
-              <TokenSummaryStat
-                label="Without Token Data"
-                value={formatTokenCount(result.sessionsWithoutTokenUsage)}
-              />
-              <TokenSummaryStat
-                label="Failed"
-                value={formatTokenCount(result.failedSessionCount)}
-              />
-              <TokenSummaryStat
-                label="Token Rows"
-                value={formatTokenCount(result.tokenCountRows)}
-              />
-              <TokenSummaryStat
-                label="Oversized Rows"
-                value={formatTokenCount(result.oversizedLineCount)}
-              />
-            </div>
-          </>
-        )}
+        {props.children}
 
         {(props.state.kind === "error" || props.state.kind === "cancelled") && (
           <div className="dialog-warning">
             <strong>
-              {props.state.kind === "cancelled" ? "Token summary cancelled" : "Token summary failed"}
+              {props.state.kind === "cancelled" ? props.cancelledTitle : props.failureTitle}
             </strong>
             <p>{props.state.message}</p>
           </div>
         )}
 
         <div className="dialog-actions token-dialog-actions">
-          {result ? (
-            <button
-              className="primary-button token-copy-button"
-              onClick={() => void handleCopy()}
-              type="button"
-            >
-              <CopyIcon className="button-icon" />
-              <span>
-                {copyState === "copied"
-                  ? "Copied"
-                  : copyState === "failed"
-                    ? "Copy Failed"
-                    : "Copy"}
-              </span>
-            </button>
-          ) : (
-            <span />
-          )}
+          {props.resultActions}
           <div className="token-summary-actions-right">
             {props.state.kind === "idle" && (
               <button className="ghost-button" onClick={props.onClose} type="button">
@@ -2582,6 +2777,298 @@ function TokenUsageSummaryDialog(props: {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function TokenUsageSummaryDialog(props: {
+  cancelPending: boolean;
+  fileSizeBytes: number;
+  onCancel: () => void;
+  onClose: () => void;
+  onConfirm: () => void;
+  sessionCount: number;
+  state: TokenUsageSummaryState;
+}) {
+  const [copyState, , setCopyState] =
+    useTimedActionState<"idle" | "copied" | "failed">("idle", 1600);
+  const result = props.state.kind === "idle" ? null : props.state.result;
+
+  const handleCopy = async (): Promise<void> => {
+    if (!result) {
+      return;
+    }
+
+    let ok = false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(formatTokenUsageSummaryForClipboard(result));
+        ok = true;
+      }
+    } catch {
+      ok = false;
+    }
+
+    setCopyState(ok ? "copied" : "failed");
+  };
+
+  return (
+    <SummaryDialogShell
+      cancelPending={props.cancelPending}
+      cancelledTitle="Token summary cancelled"
+      failureTitle="Token summary failed"
+      fileSizeBytes={props.fileSizeBytes}
+      idleDescription="codlogs will scan the current filtered set and sum token_count totals. You can cancel the scan after it starts."
+      idleMessage="Token counts are read from every currently filtered JSONL file. Large logs can take a while."
+      idleTitle="Run token summary?"
+      kicker="Filtered tokens"
+      onCancel={props.onCancel}
+      onClose={props.onClose}
+      onConfirm={props.onConfirm}
+      resultActions={
+        result ? (
+          <button
+            className="primary-button token-copy-button"
+            onClick={() => void handleCopy()}
+            type="button"
+          >
+            <CopyIcon className="button-icon" />
+            <span>
+              {copyState === "copied"
+                ? "Copied"
+                : copyState === "failed"
+                  ? "Copy Failed"
+                  : "Copy"}
+            </span>
+          </button>
+        ) : (
+          <span />
+        )
+      }
+      sessionCount={props.sessionCount}
+      state={props.state}
+      title="Token Summary"
+    >
+      {result && (
+        <>
+          <div className="token-usage-grid">
+            <TokenUsageStat label="Total" value={result.tokenUsage.totalTokens} />
+            <TokenUsageStat label="Input" value={result.tokenUsage.inputTokens} />
+            <TokenUsageStat label="Cached Input" value={result.tokenUsage.cachedInputTokens} />
+            <TokenUsageStat
+              label="Uncached Input"
+              value={getUncachedInputTokens(result.tokenUsage)}
+            />
+            <TokenUsageStat
+              label="Reasoning Output"
+              value={result.tokenUsage.reasoningOutputTokens}
+            />
+            <TokenUsageStat label="Output" value={result.tokenUsage.outputTokens} />
+          </div>
+          <div className="token-summary-stats">
+            <TokenSummaryStat
+              label="With Token Data"
+              value={formatTokenCount(result.sessionsWithTokenUsage)}
+            />
+            <TokenSummaryStat
+              label="Without Token Data"
+              value={formatTokenCount(result.sessionsWithoutTokenUsage)}
+            />
+            <TokenSummaryStat
+              label="Failed"
+              value={formatTokenCount(result.failedSessionCount)}
+            />
+            <TokenSummaryStat
+              label="Token Rows"
+              value={formatTokenCount(result.tokenCountRows)}
+            />
+            <TokenSummaryStat
+              label="Oversized Rows"
+              value={formatTokenCount(result.oversizedLineCount)}
+            />
+          </div>
+        </>
+      )}
+    </SummaryDialogShell>
+  );
+}
+
+function ErroredToolCallSummaryDialog(props: {
+  cancelPending: boolean;
+  fileSizeBytes: number;
+  onCancel: () => void;
+  onClose: () => void;
+  onConfirm: () => void;
+  sessionCount: number;
+  state: ErroredToolCallSummaryState;
+  suggestedFileNamePrefix: string;
+}) {
+  const [copyState, , setCopyState] =
+    useTimedActionState<"idle" | "copied" | "failed">("idle", 1600);
+  const [saveState, setSaveState, setTemporarySaveState] =
+    useTimedActionState<"idle" | "saving" | "saved" | "failed">("idle", 1800);
+  const result = props.state.kind === "idle" ? null : props.state.result;
+
+  const handleCopy = async (): Promise<void> => {
+    if (!result) {
+      return;
+    }
+
+    let ok = false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(formatErroredToolCallSummaryForClipboard(result));
+        ok = true;
+      }
+    } catch {
+      ok = false;
+    }
+
+    setCopyState(ok ? "copied" : "failed");
+  };
+
+  const handleSave = async (): Promise<void> => {
+    if (!result || saveState === "saving") {
+      return;
+    }
+
+    setSaveState("saving");
+    try {
+      const response = await getRpc().request.saveMarkdownFile({
+        content: formatErroredToolCallSummaryAsMarkdown(result),
+        suggestedFileName: buildSummaryFileName(props.suggestedFileNamePrefix),
+      });
+      if (response.outputPath) {
+        setTemporarySaveState("saved");
+      } else {
+        setSaveState("idle");
+      }
+    } catch {
+      setTemporarySaveState("failed");
+    }
+  };
+
+  return (
+    <SummaryDialogShell
+      cancelPending={props.cancelPending}
+      cancelledTitle="Tool error summary cancelled"
+      failureTitle="Tool error summary failed"
+      fileSizeBytes={props.fileSizeBytes}
+      idleDescription="codlogs will scan the current filtered set, classify errored tool outputs, and group distinct tool call patterns. You can cancel the scan after it starts."
+      idleMessage="Tool call outputs are matched back to tool inputs and grouped by failure pattern."
+      idleTitle="Run tool error summary?"
+      kicker="Filtered tool errors"
+      onCancel={props.onCancel}
+      onClose={props.onClose}
+      onConfirm={props.onConfirm}
+      resultActions={
+        result ? (
+          <div className="summary-output-actions">
+            <button
+              className="primary-button token-copy-button"
+              disabled={saveState === "saving"}
+              onClick={() => void handleSave()}
+              type="button"
+            >
+              <span>
+                {saveState === "saving"
+                  ? "Saving..."
+                  : saveState === "saved"
+                    ? "Saved"
+                    : saveState === "failed"
+                      ? "Save Failed"
+                      : "Save As"}
+              </span>
+            </button>
+            <button
+              className="ghost-button token-copy-button"
+              onClick={() => void handleCopy()}
+              type="button"
+            >
+              <CopyIcon className="button-icon" />
+              <span>
+                {copyState === "copied"
+                  ? "Copied"
+                  : copyState === "failed"
+                    ? "Copy Failed"
+                    : "Copy"}
+              </span>
+            </button>
+          </div>
+        ) : (
+          <span />
+        )
+      }
+      sessionCount={props.sessionCount}
+      state={props.state}
+      title="Tool Error Summary"
+    >
+      {result && (
+        <>
+          <div className="token-summary-stats">
+            <TokenSummaryStat
+              label="Errored Calls"
+              value={formatTokenCount(result.erroredToolCallCount)}
+            />
+            <TokenSummaryStat
+              label="Distinct"
+              value={formatTokenCount(result.distinctErroredToolCalls.length)}
+            />
+            <TokenSummaryStat
+              label="Sessions With Errors"
+              value={formatTokenCount(result.sessionsWithErroredToolCalls)}
+            />
+            <TokenSummaryStat
+              label="Without Errors"
+              value={formatTokenCount(result.sessionsWithoutErroredToolCalls)}
+            />
+            <TokenSummaryStat
+              label="Failed"
+              value={formatTokenCount(result.failedSessionCount)}
+            />
+            <TokenSummaryStat
+              label="Oversized Rows"
+              value={formatTokenCount(result.oversizedLineCount)}
+            />
+          </div>
+          {result.distinctErroredToolCalls.length > 0 ? (
+            <div className="tool-error-list">
+              {result.distinctErroredToolCalls.map((pattern, index) => (
+                <ErroredToolCallPatternRow
+                  key={`${pattern.toolName}-${pattern.errorPattern}-${index}`}
+                  pattern={pattern}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="dialog-warning dialog-warning-neutral">
+              <strong>No errored tool calls found</strong>
+              <p>The scanned sessions did not contain tool outputs matching the error patterns.</p>
+            </div>
+          )}
+        </>
+      )}
+    </SummaryDialogShell>
+  );
+}
+
+function ErroredToolCallPatternRow(props: { pattern: SessionErroredToolCallPattern }) {
+  return (
+    <div className="tool-error-card">
+      <div className="tool-error-card-header">
+        <div>
+          <strong>{props.pattern.toolName}</strong>
+          <span>{props.pattern.callKind}</span>
+        </div>
+        <span>{formatTokenCount(props.pattern.occurrences)}x</span>
+      </div>
+      <p className="tool-error-pattern">{props.pattern.errorPattern}</p>
+      <div className="tool-error-meta">
+        <span>{formatTokenCount(props.pattern.sessionCount)} session{props.pattern.sessionCount === 1 ? "" : "s"}</span>
+        {props.pattern.exitCode !== null && <span>exit {props.pattern.exitCode}</span>}
+      </div>
+      <pre>{props.pattern.argumentsPreview || "(empty input)"}</pre>
+      {props.pattern.sampleOutput && <pre>{props.pattern.sampleOutput}</pre>}
     </div>
   );
 }
