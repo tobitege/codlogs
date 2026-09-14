@@ -3,9 +3,9 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white" alt="TypeScript">
+  <img src="https://img.shields.io/badge/TypeScript-7.x-3178C6?logo=typescript&logoColor=white" alt="TypeScript">
   <img src="https://img.shields.io/badge/Bun-1.x-000000?logo=bun&logoColor=white" alt="Bun">
-  <img src="https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=000000" alt="React">
+  <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=000000" alt="React">
   <img src="https://img.shields.io/badge/Electrobun-Desktop-7A5CFA" alt="Electrobun">
   <img src="https://img.shields.io/badge/@tobitege-000000?logo=x&logoColor=white" alt="X @tobitege">
 </p>
@@ -21,6 +21,7 @@ Planning and investigation artifacts for this repo live under `devlog/YYYY-MM-DD
 
 This repository uses Bun as its development package manager and commits `bun.lock`.
 If you are working in this repo, use `bun install` instead of `npm install` or `pnpm install`.
+New dependency versions must be at least seven days old. `bunfig.toml` applies this delay to direct and transitive package resolution.
 
 <p align="center">
   <img src="./codlogs-export-options.png" alt="codlogs" width="500">
@@ -98,7 +99,9 @@ bun run build
 Notes:
 
 - `bun run start` is the easiest local launch path because it builds the web assets first
-- the first Electrobun run downloads its platform-specific core binaries
+- the first desktop command downloads the Electrobun 2 toolchain and prepares `.hutch/devkit`; the app uses Bun as its main-process runtime
+- `bun run prepare:desktop` prepares the SDK for editor support without building or starting the app
+- `bun run typecheck` prepares the SDK and checks TypeScript; `bun run test` runs the shared regression suite
 - the app defaults to the current folder tree on launch
 
 Current desktop app highlights:
@@ -135,6 +138,9 @@ Current behavior:
 - offers `Analyze Anyway` for a bounded manual scan when automatic analysis is skipped
 - treats oversized JSONL rows as partial-analysis conditions instead of crashing normal inspection
 - streams Markdown and HTML export so large session files do not require whole-file reads during export
+- publishes the output only after the complete transcript has been written; cancellation and write errors preserve an existing export
+- gives each export its own image subfolder under `<output-name>.assets`, so other exports retain their original images
+- retains uniquely named `.partial` files and image subfolders from interrupted exports for recovery; codlogs does not delete previous exports or sidecars
 
 Practical effect:
 
@@ -183,3 +189,14 @@ Compatibility notes:
 - sanitized output is derived, not byte-for-byte identical to the original
 - preserving both opaque compaction rows and `type: "compacted"` rows is intentional because Codex resume compatibility depends on them
 - after a successful sanitize run, the desktop UI refreshes the session list automatically
+
+## Changelog
+
+### [1.4.0] - 2026-09-14
+
+- Preserve existing exports and images when an export is cancelled or fails. Publish completed transcripts atomically and isolate image files per export.
+- Escape HTML headers and generated Markdown metadata. Validate image URLs and base64 data, encode asset links, and fix image labels and custom output filenames.
+- Preserve message indentation, line breaks, and image order. Keep later user messages that quote bootstrap instructions and omit images from excluded bootstrap messages.
+- Accept UTF-8 BOM metadata and skip malformed or non-object JSON records. Handle large JSONL rows and tool output without repeated buffer copies or code-fence argument overflow.
+- Use one streaming export pipeline, remove unused whole-file exporters, and add regression tests for both formats and the Node CLI.
+- Update all ten direct dependencies and the lockfile, subject to the seven-day release delay. Migrate the desktop build to Electrobun 2.0.1 and TypeScript 7.0.2, with React 19.2.8 and Vite 8.2.2.

@@ -10,6 +10,7 @@ out/
 *.tsbuildinfo
 .cache/
 .vite/
+.hutch/
 coverage/
 
 # Logs

@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
   AUTO_DETAIL_PARSE_LIMIT_BYTES,
+  EXPORT_MAX_JSONL_LINE_BYTES,
   MAX_JSONL_LINE_BYTES_HARD,
+  exportSessionJsonlToHtml,
   exportSessionJsonlToMarkdown,
   findCodexSessions,
   getSessionDetailMetrics,
@@ -56,6 +59,228 @@ async function createTempDir(prefix: string): Promise<string> {
   tempDirectories.push(directory);
   return directory;
 }
+
+describe("session export regressions", () => {
+  const png = "data:image/png;base64,iVBORw0KGgo=";
+  const message = (content: unknown, extra: Record<string, unknown> = {}) => ({
+    type: "response_item",
+    timestamp: "2026-09-14T10:00:00Z",
+    payload: { type: "message", role: "user", content, ...extra },
+  });
+  async function fixture(rows: unknown[], name = "session"): Promise<string> {
+    const directory = await createTempDir("codlogs-export-review-");
+    const file = path.join(directory, `${name}.jsonl`);
+    const meta = { type: "session_meta", payload: { id: "review", cwd: directory } };
+    await fs.writeFile(file, [meta, ...rows].map(row => JSON.stringify(row)).join("\n"));
+    return file;
+  }
+
+  test("escapes every HTML message and reasoning header field", async () => {
+    const attack = '<img src=x onerror="alert(1)">';
+    const file = await fixture([
+      { ...message([{ text: "body" }], { role: attack, phase: attack }), timestamp: attack },
+      { type: "response_item", timestamp: attack, payload: { type: "reasoning", summary: [{ text: attack }] } },
+    ]);
+    const html = await fs.readFile(await exportSessionJsonlToHtml(file), "utf8");
+    expect(html).not.toContain(attack);
+    expect(html).toContain("&lt;img");
+    expect(html).toContain('class="bubble bubble-unknown"');
+  });
+
+  for (const format of ["markdown", "html"] as const) {
+    const exporter = format === "markdown" ? exportSessionJsonlToMarkdown : exportSessionJsonlToHtml;
+    const extension = format === "markdown" ? "md" : "html";
+
+    test(`${format} preserves text/image order and indentation`, async () => {
+      const file = await fixture([message([
+        { text: "    first\n      second" },
+        { type: "input_image", image_url: png },
+        { text: "after image" },
+      ])]);
+      const output = await fs.readFile(await exporter(file, { includeImages: true }), "utf8");
+      expect(output).toContain("    first\n      second");
+      const imageOffset = output.indexOf(format === "markdown" ? "![Image" : "<img src=");
+      expect(imageOffset).toBeGreaterThan(output.indexOf("    first"));
+      expect(imageOffset).toBeLessThan(output.indexOf("after image"));
+      if (format === "html") expect(output).toContain("white-space: pre-wrap");
+    });
+
+    test(`${format} keeps later user messages that quote bootstrap instructions`, async () => {
+      const quoted = "Please explain <environment_context> and # AGENTS.md instructions.";
+      const file = await fixture([
+        message([{ text: "# AGENTS.md instructions for demo" }, { type: "input_image", image_url: png }]),
+        message([{ text: "real question" }]),
+        message([{ text: quoted }]),
+      ]);
+      const outputPath = await exporter(file, { includeImages: true });
+      const output = await fs.readFile(outputPath, "utf8");
+      expect(output).not.toContain("instructions for demo");
+      expect(output).toContain("Please explain");
+      expect(output).not.toContain("iVBORw0KGgo=");
+      const names = await fs.readdir(path.dirname(file));
+      expect(names.some(name => name.endsWith(".assets"))).toBe(false);
+    });
+
+    test(`${format} ignores non-object JSON and accepts UTF-8 BOM metadata`, async () => {
+      const file = await fixture([null, false, [], 123, message([{ text: "kept" }])]);
+      await fs.writeFile(file, `\uFEFF${await fs.readFile(file, "utf8")}\n{broken\n`);
+      const output = await fs.readFile(await exporter(file), "utf8");
+      expect(output).toContain("kept");
+    });
+
+    test(`${format} cancellation preserves existing transcript and sidecars`, async () => {
+      const file = await fixture([message([{ text: "replacement" }, { type: "input_image", image_url: png }])]);
+      const outputPath = file.replace(/\.jsonl$/, `.${extension}`);
+      const assetDirectory = file.replace(/\.jsonl$/, ".assets");
+      await fs.writeFile(outputPath, "previous export");
+      await fs.mkdir(assetDirectory);
+      const assetPath = path.join(assetDirectory, "image-001.png");
+      await fs.writeFile(assetPath, "previous asset");
+      const controller = new AbortController();
+      await expect(exporter(file, { includeImages: true }, {
+        signal: controller.signal,
+        onProgress(progress) { if (progress.progressPercent === 96) controller.abort(); },
+      })).rejects.toThrow();
+      expect(await fs.readFile(outputPath, "utf8")).toBe("previous export");
+      expect(await fs.readFile(assetPath, "utf8")).toBe("previous asset");
+    });
+
+    test(`${format} reports destination errors as promise rejection`, async () => {
+      const file = await fixture([message([{ text: "body" }])]);
+      const destination = file.replace(/\.jsonl$/, `.${extension}`);
+      await fs.mkdir(destination);
+      await expect(exporter(file)).rejects.toThrow();
+      expect((await fs.stat(destination)).isDirectory()).toBe(true);
+    });
+
+    test(`${format} rejects unsafe image URLs and preserves ordinary URL-bearing text`, async () => {
+      const file = await fixture([message([
+        { type: "input_image", image_url: "javascript:alert(1)" },
+        { type: "input_image", image_url: "file:///private/image.png" },
+        { type: "input_text", text: "keep linked text", url: "https://example.com" },
+        { type: "input_image", image_url: { url: png } },
+      ])]);
+      const output = await fs.readFile(await exporter(file, { includeImages: true }), "utf8");
+      expect(output).not.toContain("javascript:");
+      expect(output).not.toContain("file:///private");
+      expect(output).toContain("keep linked text");
+      expect(output).toContain(format === "markdown" ? "![Image 1]" : 'alt="Image 1"');
+    });
+
+    test(`${format} includes all tool types only when requested`, async () => {
+      const file = await fixture([
+        ...["function_call", "custom_tool_call"].map(type => ({ type: "response_item", payload: { type, name: "review-tool", arguments: "args", input: "input" } })),
+        ...["function_call_output", "custom_tool_call_output"].map(type => ({ type: "response_item", payload: { type, call_id: "review-call", output: "tool result" } })),
+      ]);
+      const hidden = await fs.readFile(await exporter(file), "utf8");
+      const included = await fs.readFile(await exporter(file, { includeToolCallResults: true }), "utf8");
+      expect(hidden).not.toContain("review-tool");
+      expect(hidden).not.toContain("tool result");
+      expect(included).toContain("review-tool");
+      expect(included).toContain("review-call");
+      expect(included.match(/tool result/g)?.length).toBe(2);
+    });
+
+    test(`${format} stays successful after the committed output receives late cancellation`, async () => {
+      const file = await fixture([message([{ text: "complete" }])]);
+      const controller = new AbortController();
+      const output = await exporter(file, {}, {
+        signal: controller.signal,
+        onProgress(progress) { if (progress.progressPercent === 100) controller.abort(); },
+      });
+      expect(await fs.readFile(output, "utf8")).toContain("complete");
+    });
+  }
+
+  test("HTML inline and external images have successive labels", async () => {
+    const file = await fixture([message([
+      { type: "input_image", image_url: png },
+      { type: "input_image", image_url: "https://example.com/image.png" },
+      { type: "input_image", image_url: png },
+    ])]);
+    const html = await fs.readFile(await exportSessionJsonlToHtml(file, { includeImages: true }), "utf8");
+    for (const index of [1, 2, 3]) expect(html).toContain(`alt="Image ${index}"`);
+  });
+
+  test("HTML sidecars follow the selected output name and cannot overwrite another export", async () => {
+    const file = await fixture([message([{ type: "input_image", image_url: png }])], "source");
+    const outputPath = path.join(path.dirname(file), "chosen (name) #1.html");
+    await exportSessionJsonlToHtml(file, { includeImages: true, inlineImages: false, outputPath });
+    const first = await fs.readFile(outputPath, "utf8");
+    const src = first.match(/<img src="([^"]+)"/)?.[1];
+    expect(src).toBeDefined();
+    expect(src).toContain("chosen%20%28name%29%20%231.assets/");
+    const imagePath = path.resolve(path.dirname(file), decodeURIComponent(src!));
+    expect((await fs.readFile(imagePath)).toString("base64")).toBe("iVBORw0KGgo=");
+    await exportSessionJsonlToHtml(file, { includeImages: true, inlineImages: false, outputPath });
+    expect((await fs.readFile(imagePath)).toString("base64")).toBe("iVBORw0KGgo=");
+  });
+
+  test("Markdown image links encode punctuation and reject malformed base64", async () => {
+    const file = await fixture([message([
+      { type: "input_image", image_url: png, alt_text: "A [bracket] <tag>\nnext" },
+      { type: "input_image", image_url: "data:image/png;base64,!!!" },
+    ])], "name (x) #1");
+    const markdown = await fs.readFile(await exportSessionJsonlToMarkdown(file, { includeImages: true }), "utf8");
+    expect(markdown).toContain("name%20%28x%29%20%231.assets/");
+    expect(markdown.match(/!\[/g)?.length).toBe(1);
+    expect(markdown).not.toContain("<tag>");
+  });
+
+  test("Markdown code fences handle many tilde runs without argument overflow", async () => {
+    const output = "~x".repeat(160000) + "\n~~~~\n";
+    const file = await fixture([{ type: "response_item", payload: { type: "function_call_output", output } }]);
+    const markdown = await fs.readFile(await exportSessionJsonlToMarkdown(file, { includeToolCallResults: true }), "utf8");
+    expect(markdown).toContain(`~~~~~text\n${output}\n~~~~~`);
+  });
+
+  test("Node CLI writes HTML sidecars and handles large Markdown tool output", async () => {
+    const output = "~x".repeat(160000) + "\n~~~~\n";
+    const file = await fixture([
+      message([{ type: "input_image", image_url: png }]),
+      { type: "response_item", payload: { type: "function_call_output", output } },
+    ]);
+    const cli = path.resolve(import.meta.dir, "../../codlogs-sessions.ts");
+    const run = (args: string[]) => execFileSync("node", ["--no-warnings", "--experimental-strip-types", cli, ...args], { windowsHide: true });
+    run(["--html", file, "--include-images"]);
+    const html = await fs.readFile(file.replace(/\.jsonl$/, ".html"), "utf8");
+    expect(html).toContain("./session.assets/");
+    expect(html).not.toContain(png);
+    run(["--md", file, "--include-tool-results"]);
+    const markdown = await fs.readFile(file.replace(/\.jsonl$/, ".md"), "utf8");
+    expect(markdown).toContain(`~~~~~text\n${output}\n~~~~~`);
+  });
+
+  test("Markdown escapes generated headings and image labels", async () => {
+    const file = await fixture([message([
+      { type: "input_image", image_url: png, alt_text: "[label] *text*" },
+    ], { phase: "\n# injected" })]);
+    const markdown = await fs.readFile(await exportSessionJsonlToMarkdown(file, { includeImages: true }), "utf8");
+    expect(markdown).toContain("![\\[label\\] \\*text\\*]");
+    expect(markdown).not.toContain("\n# injected");
+  });
+
+  test("oversized export rows report their complete byte length and preserve an existing export", async () => {
+    const file = await fixture([]);
+    const outputPath = file.replace(/\.jsonl$/, ".md");
+    await fs.writeFile(outputPath, "previous export");
+    const handle = await fs.open(file, "a");
+    const chunk = "x".repeat(1024 * 1024);
+    try {
+      await handle.writeFile("\n");
+      for (let count = 0; count < EXPORT_MAX_JSONL_LINE_BYTES / chunk.length; count++) {
+        await handle.writeFile(chunk);
+      }
+      await handle.writeFile(`${"x".repeat(73)}\n`);
+    } finally {
+      await handle.close();
+    }
+    await expect(exportSessionJsonlToMarkdown(file)).rejects.toMatchObject({
+      name: "OversizedJsonlLineError", byteLength: EXPORT_MAX_JSONL_LINE_BYTES + 73,
+    });
+    expect(await fs.readFile(outputPath, "utf8")).toBe("previous export");
+  }, 20000);
+});
 
 async function writeSessionMetaFile(options: {
   codexHome: string;

@@ -1,6 +1,6 @@
 {
   "name": "codlogs",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "private": true,
   "description": "Codex session CLI and Electrobun browser.",
   "license": "UNLICENSED",
@@ -11,12 +11,15 @@
     "codlogs-sessions": "./codlogs-sessions.cjs"
   },
   "scripts": {
-    "build:web": "vite build",
-    "start": "vite build && electrobun dev",
+    "prepare:desktop": "electrobun prepare",
+    "typecheck": "bun run prepare:desktop && tsc --noEmit",
+    "test": "bun test src/shared/codlogs-core.test.ts",
+    "build:web": "bun run prepare:desktop && vite build",
+    "start": "bun run build:web && electrobun dev",
     "dev": "electrobun dev --watch",
     "dev:hmr": "concurrently \"bun run hmr\" \"bun run start\"",
-    "hmr": "vite --port 5173",
-    "build": "vite build && electrobun build"
+    "hmr": "bun run prepare:desktop && vite --port 5173",
+    "build": "bun run build:web && electrobun build"
   },
   "files": [
     "README.md",
@@ -24,6 +27,8 @@
     "codlogs-sessions.cjs",
     "codlogs-sessions.ts",
     "electrobun.config.ts",
+    "hutch.config.ts",
+    "bunfig.toml",
     "vite.config.ts",
     "tsconfig.json",
     "src"
@@ -33,17 +38,17 @@
     "bun": ">=1.3.12"
   },
   "dependencies": {
-    "electrobun": "1.18.1",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "@types/bun": "1.3.14",
-    "@types/react": "19.2.17",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "6.0.2",
-    "concurrently": "10.0.3",
-    "typescript": "^6.0.3",
-    "vite": "8.0.16"
+    "electrobun": "2.0.1",
+    "@types/bun": "1.4.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "6.1.1",
+    "concurrently": "10.0.5",
+    "typescript": "^7.0.2",
+    "vite": "8.2.2"
   }
 }

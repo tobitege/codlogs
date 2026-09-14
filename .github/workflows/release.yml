@@ -127,7 +127,10 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Typecheck
-        run: bunx tsc --noEmit
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
 
       - name: Build web bundle
         run: bun run build:web
@@ -177,16 +180,16 @@ jobs:
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
 
-          if [ ! -f CHANGELOG.md ]; then
+          if [ ! -f README.md ]; then
             echo "No changelog entry found for this version." > changelog_section.md
             exit 0
           fi
 
           CHANGELOG=$(awk -v ver="$VERSION" '
-            $0 ~ "^## \\[" ver "\\]" { found=1; next }
-            found && /^## \\[/ { exit }
+            $1 == "###" && $2 == "[" ver "]" { found=1; next }
+            found && $1 == "###" { exit }
             found { print }
-          ' CHANGELOG.md)
+          ' README.md)
 
           if [ -z "$CHANGELOG" ]; then
             CHANGELOG="No changelog entry found for this version."

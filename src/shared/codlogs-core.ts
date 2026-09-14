@@ -1,9 +1,9 @@
 import * as childProcess from "node:child_process";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream } from "node:fs";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { once } from "node:events";
 
 export type SessionKind = "live" | "archived";
 export type ScopeMode = "repo" | "cwd" | "all";
@@ -223,11 +223,6 @@ type SessionExportMetadata = {
   modelProvider: string | null;
 };
 
-type NormalizedMarkdownExportOptions = {
-  includeImages: boolean;
-  includeToolCallResults: boolean;
-};
-
 type NormalizedHtmlExportOptions = {
   includeImages: boolean;
   inlineImages: boolean;
@@ -239,27 +234,13 @@ type ExportImageAsset = {
   data: Uint8Array;
 };
 
-type MarkdownImageAsset = ExportImageAsset;
-
-type HtmlImageAsset = ExportImageAsset;
-
-type MarkdownRenderContext = {
+type ExportRenderContext = {
+  format: "markdown" | "html";
   assetDirectoryName: string;
-  assets: MarkdownImageAsset[];
+  assets: ExportImageAsset[];
   nextImageIndex: number;
-  options: NormalizedMarkdownExportOptions;
-};
-
-type HtmlRenderContext = {
-  assetDirectoryName: string;
-  assets: HtmlImageAsset[];
-  nextImageIndex: number;
+  hasConversation: boolean;
   options: NormalizedHtmlExportOptions;
-};
-
-type RenderedMessageContent = {
-  text: string;
-  imageMarkdown: string[];
 };
 
 type ExportRuntimeOptions = {
@@ -331,20 +312,6 @@ type StreamJsonlLinesOptions = {
 
 type StreamJsonlRecordsOptions = StreamJsonlLinesOptions;
 
-type PersistedAssetContext = {
-  assetDirectoryName: string;
-  assetDirectoryPath: string | null;
-  nextImageIndex: number;
-};
-
-type StreamMarkdownRenderContext = PersistedAssetContext & {
-  options: NormalizedMarkdownExportOptions;
-};
-
-type StreamHtmlRenderContext = PersistedAssetContext & {
-  options: NormalizedHtmlExportOptions;
-};
-
 export const DEFAULT_CODEX_HOME = path.join(os.homedir(), ".codex");
 
 const FIRST_LINE_READ_BYTES = 64 * 1024;
@@ -369,7 +336,6 @@ const WSL_UNC_PATH_CANDIDATE_REGEX =
   /\\\\wsl(?:\.localhost)?\\[^\\/:*?"<>|\r\n]+(?:\\[^\\/:*?"<>|\r\n]+)*/gi;
 const WSL_MOUNT_PATH_CANDIDATE_REGEX = /\/mnt\/[a-z](?:\/[^\s"'<>|`]+)*/gi;
 const ENVIRONMENT_CWD_REGEX = /<cwd>([^<]+)<\/cwd>/gi;
-const EXPORT_PROGRESS_PULSE_RECORD_INTERVAL = 100;
 
 class ExportCancelledError extends Error {
   constructor() {
@@ -555,7 +521,8 @@ async function *streamJsonlLines(
   const oversizedStrategy = options.oversizedStrategy ?? "emit";
   const stream = createReadStream(filePath);
 
-  let pending = Buffer.alloc(0);
+  let pendingChunks: Buffer[] = [];
+  let pendingLength = 0;
   let oversizeByteLength: number | null = null;
   let lineNumber = 0;
   let bytesProcessed = 0;
@@ -578,14 +545,15 @@ async function *streamJsonlLines(
           filePath,
           lineNumber + 1,
           segment,
-          pending,
+          joinByteSequences(pendingChunks, pendingLength),
           oversizeByteLength,
           maxLineBytes,
           oversizedStrategy,
           bytesProcessed,
           options.requiredLineContent,
         );
-        pending = Buffer.alloc(0);
+        pendingChunks = [];
+        pendingLength = 0;
         oversizeByteLength = null;
         segmentStart = index + 1;
         lineNumber += 1;
@@ -604,25 +572,26 @@ async function *streamJsonlLines(
         continue;
       }
 
-      const nextLength = pending.length + trailing.length;
+      const nextLength = pendingLength + trailing.length;
       if (nextLength > maxLineBytes) {
         oversizeByteLength = nextLength;
-        pending = Buffer.alloc(0);
+        pendingChunks = [];
+        pendingLength = 0;
         continue;
       }
 
-      pending =
-        pending.length === 0 ? cloneByteSequence(trailing) : concatByteSequences(pending, trailing);
+      pendingChunks.push(trailing);
+      pendingLength = nextLength;
     }
 
     throwIfExportCancelled(options.signal);
 
-    if (pending.length > 0 || oversizeByteLength !== null) {
+    if (pendingLength > 0 || oversizeByteLength !== null) {
       const lineEvent = createJsonlLineEvent(
         filePath,
         lineNumber + 1,
         Buffer.alloc(0),
-        pending,
+        joinByteSequences(pendingChunks, pendingLength),
         oversizeByteLength,
         maxLineBytes,
         oversizedStrategy,
@@ -651,7 +620,7 @@ function createJsonlLineEvent(
   requiredLineContent?: Buffer,
 ): JsonlLineEvent | null {
   const fullByteLength =
-    oversizeByteLength ?? pending.length + trailingSegment.length;
+    (oversizeByteLength ?? pending.length) + trailingSegment.length;
 
   if (oversizeByteLength !== null || fullByteLength > maxLineBytes) {
     if (oversizedStrategy === "throw") {
@@ -697,10 +666,13 @@ function createJsonlLineEvent(
   };
 }
 
-function cloneByteSequence(bytes: ArrayLike<number>): Buffer {
-  const buffer = Buffer.allocUnsafe(bytes.length);
-  for (let index = 0; index < bytes.length; index += 1) {
-    buffer[index] = bytes[index] ?? 0;
+function joinByteSequences(chunks: Buffer[], length: number): Buffer {
+  if (chunks.length === 1) return chunks[0];
+  const buffer = Buffer.allocUnsafe(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buffer.set(chunk, offset);
+    offset += chunk.length;
   }
   return buffer;
 }
@@ -734,32 +706,22 @@ async function *streamJsonlRecords(
       continue;
     }
 
+    let record: Record<string, unknown> | null;
     try {
+      record = asObject(JSON.parse(trimmedLine));
+    } catch {
+      continue;
+    }
+    if (record) {
       yield {
         kind: "record",
         lineNumber: lineEvent.lineNumber,
         byteLength: lineEvent.byteLength,
         bytesProcessed: lineEvent.bytesProcessed,
-        record: JSON.parse(trimmedLine) as JsonlRecord,
+        record,
       };
-    } catch {
-      // Ignore malformed lines so a single bad record does not block processing.
     }
   }
-}
-
-async function writeTextToStream(
-  stream: ReturnType<typeof createWriteStream>,
-  text: string,
-): Promise<void> {
-  if (!stream.write(text, "utf8")) {
-    await once(stream, "drain");
-  }
-}
-
-async function closeWriteStream(stream: ReturnType<typeof createWriteStream>): Promise<void> {
-  stream.end();
-  await once(stream, "finish");
 }
 
 export async function findCodexSessions(
@@ -1413,7 +1375,7 @@ export async function exportSessionJsonlToMarkdown(
     throw new Error(`Expected a .jsonl file: ${sessionFilePath}`);
   }
 
-  return exportSessionJsonlToMarkdownStreamed(sessionFilePath, options, runtimeOptions);
+  return exportSessionStreamed(sessionFilePath, "markdown", options, runtimeOptions);
 }
 
 export async function exportSessionJsonlToHtml(
@@ -1430,312 +1392,156 @@ export async function exportSessionJsonlToHtml(
     throw new Error(`Expected a .jsonl file: ${sessionFilePath}`);
   }
 
-  return exportSessionJsonlToHtmlStreamed(sessionFilePath, options, runtimeOptions);
+  return exportSessionStreamed(sessionFilePath, "html", options, runtimeOptions);
 }
 
-async function exportSessionJsonlToMarkdownStreamed(
+async function exportSessionStreamed(
   sessionFilePath: string,
-  options: MarkdownExportOptions,
-  runtimeOptions: ExportRuntimeOptions,
-): Promise<string> {
-  const normalizedOptions = normalizeMarkdownExportOptions(options);
-  const outputName = path.parse(sessionFilePath).name;
-  const outputDirectory = normalizeOptionalPathInput(options.outputDirectory);
-  const outputDirectoryPath = outputDirectory
-    ? resolveFilesystemPath(outputDirectory)
-    : path.dirname(sessionFilePath);
-  const outputPath = path.join(outputDirectoryPath, `${outputName}.md`);
-  const assetDirectoryName = `${outputName}.assets`;
-  const assetDirectoryPath = normalizedOptions.includeImages
-    ? path.join(outputDirectoryPath, assetDirectoryName)
-    : null;
-  const sessionMeta = await readSessionExportMetadata(sessionFilePath);
-  const fileSizeBytes = (await fs.stat(sessionFilePath)).size;
-
-  await reportExportProgress(runtimeOptions, {
-    stage: "reading",
-    message: "Preparing Markdown export...",
-    progressPercent: 4,
-  });
-  await fs.mkdir(outputDirectoryPath, { recursive: true });
-  if (assetDirectoryPath) {
-    await fs.mkdir(assetDirectoryPath, { recursive: true });
-  }
-
-  const stream = createWriteStream(outputPath, { encoding: "utf8" });
-  const renderContext: MarkdownRenderContext = {
-    assetDirectoryName,
-    assets: [],
-    nextImageIndex: 1,
-    options: normalizedOptions,
-  };
-  let transcriptEntryCount = 0;
-  let lastProgressBytes = 0;
-
-  try {
-    await writeTextToStream(
-      stream,
-      [
-        "# Codex Session Export",
-        "",
-        `- Source JSONL: \`${sessionFilePath}\``,
-        `- Session ID: \`${sessionMeta.id}\``,
-        `- Started: ${sessionMeta.startedAt ?? "unknown"}`,
-        `- CWD: \`${sessionMeta.cwd}\``,
-        `- Originator: ${sessionMeta.originator ?? "unknown"}`,
-        `- CLI Version: ${sessionMeta.cliVersion ?? "unknown"}`,
-        `- Source: ${sessionMeta.source ?? "unknown"}`,
-        `- Model Provider: ${sessionMeta.modelProvider ?? "unknown"}`,
-        `- Included images: ${normalizedOptions.includeImages ? "yes" : "no"}`,
-        `- Included tool calls and results: ${normalizedOptions.includeToolCallResults ? "yes" : "no"}`,
-        `- Exported: ${new Date().toISOString()}`,
-        "",
-        "## Transcript",
-        "",
-      ].join("\n"),
-    );
-
-    for await (const event of streamJsonlRecords(sessionFilePath, {
-      signal: runtimeOptions.signal,
-      maxLineBytes: EXPORT_MAX_JSONL_LINE_BYTES,
-      oversizedStrategy: "throw",
-    })) {
-      if (event.kind !== "record") {
-        continue;
-      }
-
-      const record = event.record;
-      if (record.type !== "response_item") {
-        lastProgressBytes = await maybeReportByteProgress(
-          runtimeOptions,
-          event.bytesProcessed,
-          fileSizeBytes,
-          lastProgressBytes,
-          {
-            stage: "rendering",
-            startPercent: 10,
-            endPercent: 82,
-            message: "Rendering Markdown transcript...",
-          },
-        );
-        continue;
-      }
-
-      const item = asObject(record.payload);
-      if (!item || typeof item.type !== "string") {
-        continue;
-      }
-
-      const rendered =
-        item.type === "message"
-          ? renderMessageEntry(record, item, renderContext)
-          : normalizedOptions.includeToolCallResults && item.type === "function_call"
-            ? renderToolCallEntry(record, item, "Tool Call")
-            : normalizedOptions.includeToolCallResults && item.type === "function_call_output"
-              ? renderToolOutputEntry(record, item, "Tool Output")
-              : normalizedOptions.includeToolCallResults && item.type === "custom_tool_call"
-                ? renderCustomToolCallEntry(record, item)
-                : normalizedOptions.includeToolCallResults &&
-                    item.type === "custom_tool_call_output"
-                  ? renderCustomToolOutputEntry(record, item)
-                  : item.type === "reasoning"
-                    ? renderReasoningEntry(record, item)
-                    : null;
-
-      if (rendered && rendered !== "bootstrap-omitted") {
-        if (transcriptEntryCount > 0) {
-          await writeTextToStream(stream, "\n\n");
-        }
-        await writeTextToStream(stream, rendered);
-        transcriptEntryCount += 1;
-      }
-
-      await flushRenderAssets(assetDirectoryPath, renderContext.assets, runtimeOptions.signal);
-      renderContext.assets.length = 0;
-      lastProgressBytes = await maybeReportByteProgress(
-        runtimeOptions,
-        event.bytesProcessed,
-        fileSizeBytes,
-        lastProgressBytes,
-        {
-          stage: "rendering",
-          startPercent: 10,
-          endPercent: 82,
-          message: "Rendering Markdown transcript...",
-        },
-      );
-    }
-
-    if (transcriptEntryCount === 0) {
-      await writeTextToStream(stream, "_No transcript items were found in the response stream._\n");
-    } else {
-      await writeTextToStream(stream, "\n");
-    }
-
-    await reportExportProgress(runtimeOptions, {
-      stage: "writing",
-      message: "Finalizing Markdown export...",
-      progressPercent: 96,
-    });
-    await closeWriteStream(stream);
-  } catch (error) {
-    stream.destroy();
-    await cleanupFailedExport(outputPath, assetDirectoryPath);
-    throw error;
-  }
-
-  await reportExportProgress(runtimeOptions, {
-    stage: "writing",
-    message: "Markdown export ready.",
-    progressPercent: 100,
-  });
-  return outputPath;
-}
-
-async function exportSessionJsonlToHtmlStreamed(
-  sessionFilePath: string,
+  format: "markdown" | "html",
   options: HtmlExportOptions,
   runtimeOptions: ExportRuntimeOptions,
 ): Promise<string> {
-  const normalizedOptions = normalizeHtmlExportOptions(options);
-  const outputName = path.parse(sessionFilePath).name;
+  throwIfExportCancelled(runtimeOptions.signal);
+  const normalizedOptions = {
+    includeImages: options.includeImages === true,
+    inlineImages: format === "html" && options.inlineImages !== false,
+    includeToolCallResults: options.includeToolCallResults === true,
+  };
   const outputDirectory = normalizeOptionalPathInput(options.outputDirectory);
-  const explicitOutputPath = normalizeOptionalPathInput(options.outputPath);
-  const assetDirectoryName = `${outputName}.assets`;
+  const explicitOutputPath = format === "html" ? normalizeOptionalPathInput(options.outputPath) : null;
   const outputPath = explicitOutputPath
     ? ensureHtmlOutputPath(resolveFilesystemPath(explicitOutputPath))
     : path.join(
         outputDirectory ? resolveFilesystemPath(outputDirectory) : path.dirname(sessionFilePath),
-        `${outputName}.html`,
+        `${path.parse(sessionFilePath).name}.${format === "html" ? "html" : "md"}`,
       );
   const outputDirectoryPath = path.dirname(outputPath);
-  const assetDirectoryPath =
-    normalizedOptions.includeImages && !normalizedOptions.inlineImages
-      ? path.join(outputDirectoryPath, assetDirectoryName)
-      : null;
+  const assetDirectoryName = `${path.parse(outputPath).name}.assets`;
+  const exportId = randomUUID();
+  // Each run owns its sidecars; old exports keep their original image bytes.
+  const assetGenerationName = `${assetDirectoryName}/${exportId}`;
+  const assetDirectoryPath = normalizedOptions.includeImages && !normalizedOptions.inlineImages
+    ? path.join(outputDirectoryPath, assetGenerationName)
+    : null;
   const sessionMeta = await readSessionExportMetadata(sessionFilePath);
   const fileSizeBytes = (await fs.stat(sessionFilePath)).size;
-
+  const label = format === "html" ? "HTML" : "Markdown";
   await reportExportProgress(runtimeOptions, {
-    stage: "reading",
-    message: "Preparing HTML export...",
-    progressPercent: 4,
+    stage: "reading", message: `Preparing ${label} export...`, progressPercent: 4,
   });
   await fs.mkdir(outputDirectoryPath, { recursive: true });
-  if (assetDirectoryPath) {
-    await fs.mkdir(assetDirectoryPath, { recursive: true });
-  }
-
-  const stream = createWriteStream(outputPath, { encoding: "utf8" });
-  const renderContext: HtmlRenderContext = {
-    assetDirectoryName,
-    assets: [],
-    nextImageIndex: 1,
-    options: normalizedOptions,
+  // Publish only a complete file. An interrupted run retains its uniquely named
+  // .partial file for recovery; it never deletes or truncates a previous export.
+  const pendingPath = `${outputPath}.${exportId}.partial`;
+  const file = await fs.open(pendingPath, "wx");
+  const context: ExportRenderContext = {
+    format, assetDirectoryName: assetGenerationName, assets: [], nextImageIndex: 1,
+    hasConversation: false, options: normalizedOptions,
   };
   let transcriptEntryCount = 0;
   let lastProgressBytes = 0;
-
   try {
-    await writeTextToStream(
-      stream,
-      buildHtmlExportPrefix(sessionFilePath, sessionMeta, normalizedOptions, assetDirectoryName),
-    );
-
+    await file.writeFile(format === "html"
+      ? buildHtmlExportPrefix(sessionFilePath, sessionMeta, normalizedOptions, assetDirectoryName)
+      : buildMarkdownExportPrefix(sessionFilePath, sessionMeta, normalizedOptions));
     for await (const event of streamJsonlRecords(sessionFilePath, {
-      signal: runtimeOptions.signal,
-      maxLineBytes: EXPORT_MAX_JSONL_LINE_BYTES,
-      oversizedStrategy: "throw",
+      signal: runtimeOptions.signal, maxLineBytes: EXPORT_MAX_JSONL_LINE_BYTES, oversizedStrategy: "throw",
     })) {
-      if (event.kind !== "record") {
-        continue;
-      }
-
-      const record = event.record;
-      if (record.type !== "response_item") {
-        lastProgressBytes = await maybeReportByteProgress(
-          runtimeOptions,
-          event.bytesProcessed,
-          fileSizeBytes,
-          lastProgressBytes,
-          {
-            stage: "rendering",
-            startPercent: 10,
-            endPercent: 82,
-            message: "Rendering HTML transcript...",
-          },
-        );
-        continue;
-      }
-
-      const item = asObject(record.payload);
-      if (!item || typeof item.type !== "string") {
-        continue;
-      }
-
-      const rendered =
-        item.type === "message"
-          ? renderHtmlMessageEntry(record, item, renderContext)
-          : normalizedOptions.includeToolCallResults && item.type === "function_call"
-            ? renderHtmlToolCallEntry(record, item, "Tool Call")
-            : normalizedOptions.includeToolCallResults && item.type === "function_call_output"
-              ? renderHtmlToolOutputEntry(record, item, "Tool Output")
-              : normalizedOptions.includeToolCallResults && item.type === "custom_tool_call"
-                ? renderHtmlCustomToolCallEntry(record, item)
-                : normalizedOptions.includeToolCallResults &&
-                    item.type === "custom_tool_call_output"
-                  ? renderHtmlCustomToolOutputEntry(record, item)
-                  : item.type === "reasoning"
-                    ? renderHtmlReasoningEntry(record, item)
-                    : null;
-
-      if (rendered && rendered !== "bootstrap-omitted") {
-        await writeTextToStream(stream, `${rendered}\n`);
+      if (event.kind !== "record") continue;
+      throwIfExportCancelled(runtimeOptions.signal);
+      const rendered = renderExportEntry(event.record, context);
+      if (rendered) {
+        await file.writeFile(`${rendered}\n\n`);
         transcriptEntryCount += 1;
       }
-
-      await flushRenderAssets(assetDirectoryPath, renderContext.assets, runtimeOptions.signal);
-      renderContext.assets.length = 0;
+      await flushRenderAssets(assetDirectoryPath, context.assets, runtimeOptions.signal);
+      context.assets.length = 0;
       lastProgressBytes = await maybeReportByteProgress(
-        runtimeOptions,
-        event.bytesProcessed,
-        fileSizeBytes,
-        lastProgressBytes,
-        {
-          stage: "rendering",
-          startPercent: 10,
-          endPercent: 82,
-          message: "Rendering HTML transcript...",
-        },
+        runtimeOptions, event.bytesProcessed, fileSizeBytes, lastProgressBytes,
+        { stage: "rendering", startPercent: 10, endPercent: 82, message: `Rendering ${label} transcript...` },
       );
     }
-
     if (transcriptEntryCount === 0) {
-      await writeTextToStream(
-        stream,
-        `<p><em>No transcript items were found in the response stream.</em></p>\n`,
-      );
+      await file.writeFile(format === "html"
+        ? "<p><em>No transcript items were found in the response stream.</em></p>\n"
+        : "_No transcript items were found in the response stream._\n");
     }
-
-    await writeTextToStream(stream, buildHtmlExportSuffix());
+    if (format === "html") await file.writeFile(buildHtmlExportSuffix());
     await reportExportProgress(runtimeOptions, {
-      stage: "writing",
-      message: "Finalizing HTML export...",
-      progressPercent: 96,
+      stage: "writing", message: `Finalizing ${label} export...`, progressPercent: 96,
     });
-    await closeWriteStream(stream);
-  } catch (error) {
-    stream.destroy();
-    await cleanupFailedExport(outputPath, assetDirectoryPath);
-    throw error;
+  } finally {
+    await file.close();
   }
-
-  await reportExportProgress(runtimeOptions, {
-    stage: "writing",
-    message: "HTML export ready.",
-    progressPercent: 100,
-  });
+  throwIfExportCancelled(runtimeOptions.signal);
+  await fs.rename(pendingPath, outputPath);
+  // Notifications cannot roll back a committed file or turn success into cancellation.
+  try {
+    await runtimeOptions.onProgress?.({
+      stage: "writing", message: `${label} export ready.`, progressPercent: 100,
+    });
+  } catch {
+    // The export has already been published.
+  }
   return outputPath;
+}
+
+function buildMarkdownExportPrefix(
+  sessionFilePath: string,
+  meta: SessionExportMetadata,
+  options: NormalizedHtmlExportOptions,
+): string {
+  const fields = [
+    ["Source JSONL", sessionFilePath], ["Session ID", meta.id],
+    ["Started", meta.startedAt ?? "unknown"], ["CWD", meta.cwd],
+    ["Originator", meta.originator ?? "unknown"], ["CLI Version", meta.cliVersion ?? "unknown"],
+    ["Source", meta.source ?? "unknown"], ["Model Provider", meta.modelProvider ?? "unknown"],
+    ["Included images", options.includeImages ? "yes" : "no"],
+    ["Included tool calls and results", options.includeToolCallResults ? "yes" : "no"],
+    ["Exported", new Date().toISOString()],
+  ];
+  return [
+    "# Codex Session Export", "",
+    ...fields.map(([name, value]) => `- ${name}: ${escapeMarkdownText(value)}`),
+    "", "## Transcript", "", "",
+  ].join("\n");
+}
+
+function renderExportEntry(record: JsonlRecord, context: ExportRenderContext): string | null {
+  if (record.type !== "response_item") return null;
+  const item = asObject(record.payload);
+  if (!item) return null;
+  const html = context.format === "html";
+  if (item.type === "message") {
+    if (item.role === "developer" || item.role === "system") return null;
+    const text = extractMessageLikeText(item.content);
+    if (item.role === "user" && !context.hasConversation && isExportBootstrapContext(text)) return null;
+    const rendered = html ? renderHtmlMessageEntry(record, item, context) : renderMessageEntry(record, item, context);
+    if (rendered) context.hasConversation = true;
+    return rendered;
+  }
+  if (item.type === "reasoning") {
+    return html ? renderHtmlReasoningEntry(record, item) : renderReasoningEntry(record, item);
+  }
+  if (!context.options.includeToolCallResults) return null;
+  switch (item.type) {
+    case "function_call":
+      return html ? renderHtmlToolCallEntry(record, item, "Tool Call") : renderToolCallEntry(record, item, "Tool Call");
+    case "function_call_output":
+      return html ? renderHtmlToolOutputEntry(record, item, "Tool Output") : renderToolOutputEntry(record, item, "Tool Output");
+    case "custom_tool_call":
+      return html ? renderHtmlCustomToolCallEntry(record, item) : renderCustomToolCallEntry(record, item);
+    case "custom_tool_call_output":
+      return html ? renderHtmlCustomToolOutputEntry(record, item) : renderCustomToolOutputEntry(record, item);
+    default:
+      return null;
+  }
+}
+
+function isExportBootstrapContext(text: string): boolean {
+  const trimmed = text.trimStart();
+  return ["# AGENTS.md instructions", "<environment_context>", "<permissions instructions>", "<collaboration_mode>"]
+    .some(marker => trimmed.startsWith(marker));
 }
 
 async function readSessionExportMetadata(
@@ -1748,12 +1554,12 @@ async function readSessionExportMetadata(
 
   let parsed: SessionMetaRecord;
   try {
-    parsed = JSON.parse(firstLine) as SessionMetaRecord;
+    parsed = JSON.parse(firstLine.replace(/^\uFEFF/, "")) as SessionMetaRecord;
   } catch {
     throw new Error(`No session_meta record found in ${sessionFilePath}`);
   }
 
-  if (parsed.type !== "session_meta") {
+  if (!parsed || parsed.type !== "session_meta") {
     throw new Error(`No session_meta record found in ${sessionFilePath}`);
   }
 
@@ -1792,16 +1598,6 @@ async function flushRenderAssets(
   for (const asset of assets) {
     throwIfExportCancelled(signal);
     await fs.writeFile(path.join(assetDirectoryPath, asset.fileName), asset.data);
-  }
-}
-
-async function cleanupFailedExport(
-  outputPath: string,
-  assetDirectoryPath: string | null,
-): Promise<void> {
-  await fs.rm(outputPath, { force: true }).catch(() => undefined);
-  if (assetDirectoryPath) {
-    await fs.rm(assetDirectoryPath, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -2373,6 +2169,9 @@ function buildHtmlExportPrefix(
     .bubble-content {
       word-break: break-word;
     }
+    .message-text {
+      white-space: pre-wrap;
+    }
     pre {
       background: var(--pre-bg);
       padding: 1rem;
@@ -2455,116 +2254,10 @@ function throwIfExportCancelled(signal?: AbortSignal): void {
   }
 }
 
-async function parseJsonlRecordsForExport(
-  content: string,
-  runtimeOptions: ExportRuntimeOptions,
-): Promise<JsonlRecord[]> {
-  const records: JsonlRecord[] = [];
-  const lines = content.split(/\r?\n/);
-  const totalLines = Math.max(lines.length, 1);
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index].replace(/^\uFEFF/, "").trim();
-    if (!line) {
-      if (shouldPulseExportProgress(index, totalLines)) {
-        await pulseExportLoop(runtimeOptions, index + 1, totalLines, {
-          stage: "parsing",
-          startPercent: 10,
-          endPercent: 28,
-          message: "Parsing session records...",
-        });
-      }
-      continue;
-    }
-
-    try {
-      records.push(JSON.parse(line) as JsonlRecord);
-    } catch {
-      // Skip malformed lines so one bad record does not block the export.
-    }
-
-    if (shouldPulseExportProgress(index, totalLines)) {
-      await pulseExportLoop(runtimeOptions, index + 1, totalLines, {
-        stage: "parsing",
-        startPercent: 10,
-        endPercent: 28,
-        message: "Parsing session records...",
-      });
-    }
-  }
-
-  await reportExportProgress(runtimeOptions, {
-    stage: "parsing",
-    message: "Session records parsed.",
-    progressPercent: 28,
-  });
-  return records;
-}
-
-function shouldPulseExportProgress(index: number, total: number): boolean {
-  return (
-    index === 0 ||
-    index + 1 === total ||
-    (index + 1) % EXPORT_PROGRESS_PULSE_RECORD_INTERVAL === 0
-  );
-}
-
-async function pulseExportLoop(
-  runtimeOptions: ExportRuntimeOptions,
-  completed: number,
-  total: number,
-  options: ExportLoopProgressOptions,
-): Promise<void> {
-  const progressRatio = total <= 0 ? 1 : completed / total;
-  const progressPercent =
-    options.startPercent + (options.endPercent - options.startPercent) * progressRatio;
-  await reportExportProgress(runtimeOptions, {
-    stage: options.stage,
-    message: options.message,
-    progressPercent,
-  });
-  await yieldForExportLoop();
-}
-
 async function yieldForExportLoop(): Promise<void> {
   await new Promise((resolve) => {
     setTimeout(resolve, 0);
   });
-}
-
-async function writeExportAssets(
-  assetDirectoryPath: string,
-  assets: ExportImageAsset[],
-  runtimeOptions: ExportRuntimeOptions,
-  progressOptions: ExportLoopProgressOptions,
-): Promise<void> {
-  await fs.mkdir(assetDirectoryPath, { recursive: true });
-
-  for (let index = 0; index < assets.length; index += 1) {
-    throwIfExportCancelled(runtimeOptions.signal);
-    const asset = assets[index];
-    await fs.writeFile(path.join(assetDirectoryPath, asset.fileName), asset.data);
-    await pulseExportLoop(runtimeOptions, index + 1, assets.length, progressOptions);
-  }
-}
-
-function normalizeMarkdownExportOptions(
-  options: MarkdownExportOptions,
-): NormalizedMarkdownExportOptions {
-  return {
-    includeImages: options.includeImages === true,
-    includeToolCallResults: options.includeToolCallResults === true,
-  };
-}
-
-function normalizeHtmlExportOptions(
-  options: HtmlExportOptions,
-): NormalizedHtmlExportOptions {
-  return {
-    includeImages: options.includeImages === true,
-    inlineImages: options.inlineImages !== false,
-    includeToolCallResults: options.includeToolCallResults === true,
-  };
 }
 
 function ensureHtmlOutputPath(outputPath: string): string {
@@ -2884,24 +2577,6 @@ async function readFirstLine(filePath: string): Promise<string | null> {
   }
 }
 
-function parseJsonlRecords(content: string): JsonlRecord[] {
-  const records: JsonlRecord[] = [];
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.replace(/^\uFEFF/, "").trim();
-    if (!line) {
-      continue;
-    }
-
-    try {
-      records.push(JSON.parse(line) as JsonlRecord);
-    } catch {
-      // Skip malformed lines so one bad record does not block the export.
-    }
-  }
-
-  return records;
-}
-
 function valueTouchesRoot(
   value: unknown,
   rootAliases: ComparablePathAlias[],
@@ -3010,309 +2685,23 @@ function looksLikeJsonStructuredText(value: string): boolean {
   );
 }
 
-async function buildHtmlExport(
-  sessionFilePath: string,
-  records: JsonlRecord[],
-  options: NormalizedHtmlExportOptions,
-  assetDirectoryName: string,
-  runtimeOptions: ExportRuntimeOptions,
-): Promise<{ html: string; assets: HtmlImageAsset[] }> {
-  const sessionMeta = findSessionExportMetadata(records);
-  if (!sessionMeta) {
-    throw new Error(`No session_meta record found in ${sessionFilePath}`);
-  }
-
-  const transcriptSections: string[] = [];
-  let omittedBootstrapMessages = 0;
-  const renderContext: HtmlRenderContext = {
-    assetDirectoryName,
-    assets: [],
-    nextImageIndex: 1,
-    options,
-  };
-
-  for (let index = 0; index < records.length; index += 1) {
-    const record = records[index];
-    if (record.type !== "response_item") {
-      if (shouldPulseExportProgress(index, records.length)) {
-        await pulseExportLoop(runtimeOptions, index + 1, records.length, {
-          stage: "rendering",
-          startPercent: 32,
-          endPercent: 82,
-          message: "Rendering HTML transcript...",
-        });
-      }
-      continue;
-    }
-
-    const item = asObject(record.payload);
-    if (!item || typeof item.type !== "string") {
-      continue;
-    }
-
-    const rendered =
-      item.type === "message"
-        ? renderHtmlMessageEntry(record, item, renderContext)
-        : options.includeToolCallResults && item.type === "function_call"
-          ? renderHtmlToolCallEntry(record, item, "Tool Call")
-          : options.includeToolCallResults && item.type === "function_call_output"
-            ? renderHtmlToolOutputEntry(record, item, "Tool Output")
-            : options.includeToolCallResults && item.type === "custom_tool_call"
-              ? renderHtmlCustomToolCallEntry(record, item)
-              : options.includeToolCallResults && item.type === "custom_tool_call_output"
-                ? renderHtmlCustomToolOutputEntry(record, item)
-                : item.type === "reasoning"
-                  ? renderHtmlReasoningEntry(record, item)
-                  : null;
-
-    if (rendered === "bootstrap-omitted") {
-      omittedBootstrapMessages += 1;
-      continue;
-    }
-
-    if (rendered) {
-      transcriptSections.push(numberMarkdownTranscriptEntry(rendered, transcriptSections.length + 1));
-    }
-
-    if (shouldPulseExportProgress(index, records.length)) {
-      await pulseExportLoop(runtimeOptions, index + 1, records.length, {
-        stage: "rendering",
-        startPercent: 32,
-        endPercent: 82,
-        message: "Rendering HTML transcript...",
-      });
-    }
-  }
-
-  await reportExportProgress(runtimeOptions, {
-    stage: "rendering",
-    message: "HTML transcript rendered.",
-    progressPercent: 82,
-  });
-
-  const title = sessionMeta.id;
-  const styles = `
-    :root {
-      --bg: #f8f9fa;
-      --text: #212529;
-      --muted: #6c757d;
-      --accent: #0d6efd;
-      --user-bg: #e7f3ff;
-      --assistant-bg: #ffffff;
-      --border: #dee2e6;
-      --shadow: 0 2px 4px rgba(0,0,0,0.05);
-      --pre-bg: #f8f9fa;
-    }
-    html.dark {
-      --bg: #212529;
-      --text: #f8f9fa;
-      --muted: #adb5bd;
-      --accent: #3793ff;
-      --user-bg: #2b3035;
-      --assistant-bg: #343a40;
-      --border: #495057;
-      --shadow: 0 2px 4px rgba(0,0,0,0.3);
-      --pre-bg: #1a1d20;
-    }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      line-height: 1.5;
-      color: var(--text);
-      background: var(--bg);
-      max-width: 900px;
-      margin: 0 auto;
-      padding: 2rem 1rem;
-      transition: background 0.2s, color 0.2s;
-    }
-    header {
-      margin-bottom: 3rem;
-      padding-bottom: 1rem;
-      border-bottom: 1px solid var(--border);
-      position: relative;
-    }
-    .theme-toggle {
-      position: absolute;
-      top: 0;
-      right: 0;
-      padding: 0.5rem;
-      cursor: pointer;
-      background: none;
-      border: 1px solid var(--border);
-      border-radius: 0.25rem;
-      color: var(--text);
-      font-size: 0.8rem;
-    }
-    .meta-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-      gap: 1rem;
-      font-size: 0.9rem;
-      color: var(--muted);
-    }
-    .meta-item b { color: var(--text); }
-    .transcript {
-      display: flex;
-      flex-direction: column;
-      gap: 1.5rem;
-      counter-reset: bubble;
-    }
-    .bubble {
-      counter-increment: bubble;
-      max-width: 85%;
-      padding: 1rem 1.25rem;
-      border-radius: 1.25rem;
-      box-shadow: var(--shadow);
-      position: relative;
-    }
-    .bubble::before {
-      content: "#" counter(bubble);
-      position: absolute;
-      top: -0.75rem;
-      left: 1rem;
-      padding: 0.15rem 0.45rem;
-      border-radius: 999px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--muted);
-      font-size: 0.7rem;
-      font-weight: 700;
-      line-height: 1;
-    }
-    .bubble-user {
-      align-self: flex-end;
-      background: var(--user-bg);
-      border-bottom-right-radius: 0.25rem;
-    }
-    .bubble-assistant {
-      align-self: flex-start;
-      background: var(--assistant-bg);
-      border-bottom-left-radius: 0.25rem;
-      border: 1px solid var(--border);
-    }
-    .bubble-tool {
-      align-self: center;
-      background: var(--pre-bg);
-      border: 1px dashed var(--border);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size: 0.85rem;
-      max-width: 95%;
-    }
-    .bubble-reasoning {
-      align-self: flex-start;
-      background: rgba(255, 249, 219, 0.1);
-      border: 1px solid #ffe066;
-      font-style: italic;
-      font-size: 0.9rem;
-    }
-    .bubble-header {
-      font-size: 0.75rem;
-      font-weight: bold;
-      text-transform: uppercase;
-      margin-bottom: 0.5rem;
-      color: var(--muted);
-      display: flex;
-      justify-content: space-between;
-    }
-    .bubble-content {
-      word-break: break-word;
-    }
-    pre {
-      background: var(--pre-bg);
-      padding: 1rem;
-      border-radius: 0.5rem;
-      overflow-x: auto;
-      border: 1px solid var(--border);
-    }
-    code {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 0.9em;
-    }
-    img {
-      max-width: 100%;
-      height: auto;
-      border-radius: 0.5rem;
-      margin: 0.5rem 0;
-    }
-  `;
-
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Codex Session - ${escapeHtml(title)}</title>
-  <style>${styles}</style>
-  <script>
-    function toggleTheme() {
-      const isDark = document.documentElement.classList.toggle("dark");
-      localStorage.setItem("theme", isDark ? "dark" : "light");
-    }
-    if (localStorage.getItem("theme") === "dark" || (!localStorage.getItem("theme") && window.matchMedia("(prefers-color-scheme: dark)").matches)) {
-      document.documentElement.classList.add("dark");
-    }
-  </script>
-</head>
-<body>
-  <header>
-    <button class="theme-toggle" onclick="toggleTheme()">🌓 Theme</button>
-    <h1>Codex Session Export</h1>
-    <div class="meta-grid">
-      <div class="meta-item"><b>ID:</b> ${escapeHtml(sessionMeta.id)}</div>
-      <div class="meta-item"><b>Started:</b> ${escapeHtml(sessionMeta.startedAt ?? "unknown")}</div>
-      <div class="meta-item"><b>CWD:</b> ${escapeHtml(sessionMeta.cwd)}</div>
-      <div class="meta-item"><b>Originator:</b> ${escapeHtml(sessionMeta.originator ?? "unknown")}</div>
-      <div class="meta-item"><b>CLI:</b> ${escapeHtml(sessionMeta.cliVersion ?? "unknown")}</div>
-      <div class="meta-item"><b>Source:</b> ${escapeHtml(sessionMeta.source ?? "unknown")}</div>
-      <div class="meta-item"><b>Model:</b> ${escapeHtml(sessionMeta.modelProvider ?? "unknown")}</div>
-      <div class="meta-item"><b>Images:</b> ${escapeHtml(describeHtmlImageMode(options))}</div>
-      <div class="meta-item"><b>Exported:</b> ${escapeHtml(new Date().toISOString())}</div>
-    </div>
-  </header>
-  <div class="transcript">
-    ${transcriptSections.join("\n")}
-  </div>
-</body>
-</html>`;
-
-  // Use a small delay to prevent blocking the event loop too long for very large sessions
-  // but since we're in a worker-like environment (Bun RPC), the main issue is usually
-  // just the sheer size of the string being passed back.
-  
-  return { html, assets: renderContext.assets };
-}
-
 function renderHtmlMessageEntry(
   record: JsonlRecord,
   item: Record<string, unknown>,
-  context: HtmlRenderContext,
-): string | "bootstrap-omitted" | null {
+  context: ExportRenderContext,
+): string | null {
   const role = typeof item.role === "string" ? item.role : "unknown";
-  if (role === "developer") {
-    return null;
-  }
-
-  const renderedContent = renderHtmlMessageContent(item.content, context);
-  if (!renderedContent.text && renderedContent.imageHtml.length === 0) {
-    return null;
-  }
-
-  if (role === "user" && looksLikeBootstrapContext(renderedContent.text)) {
-    return "bootstrap-omitted";
-  }
-
+  const content = renderMessageContent(item.content, context);
+  if (!content) return null;
   const phase = typeof item.phase === "string" ? ` [${item.phase}]` : "";
-  const timestamp = formatTimestamp(record.timestamp);
-
+  const roleClass = role === "user" || role === "assistant" ? role : "unknown";
   return `
-    <div class="bubble bubble-${role}">
+    <div class="bubble bubble-${roleClass}">
       <div class="bubble-header">
-        <span>${toTitleCase(role)}${phase}</span>
-        <span>${timestamp}</span>
+        <span>${escapeHtml(toTitleCase(role) + phase)}</span>
+        <span>${escapeHtml(formatTimestamp(record.timestamp))}</span>
       </div>
-      <div class="bubble-content">
-        ${renderedContent.text.split("\n\n").map(p => `<p>${escapeHtml(p)}</p>`).join("")}
-        ${renderedContent.imageHtml.join("")}
-      </div>
+      <div class="bubble-content">${content}</div>
     </div>
   `;
 }
@@ -3403,121 +2792,13 @@ function renderHtmlReasoningEntry(
     <div class="bubble bubble-reasoning">
       <div class="bubble-header">
         <span>Reasoning Summary</span>
-        <span>${formatTimestamp(record.timestamp)}</span>
+        <span>${escapeHtml(formatTimestamp(record.timestamp))}</span>
       </div>
       <ul>
         ${summaries.map(s => `<li>${escapeHtml(s)}</li>`).join("")}
       </ul>
     </div>
   `;
-}
-
-function renderHtmlMessageContent(
-  content: unknown,
-  context: HtmlRenderContext,
-): { text: string; imageHtml: string[] } {
-  if (!Array.isArray(content)) {
-    return { text: "", imageHtml: [] };
-  }
-
-  const textChunks: string[] = [];
-  const imageHtml: string[] = [];
-
-  for (const item of content) {
-    if (typeof item === "string") {
-      textChunks.push(item);
-      continue;
-    }
-
-    const contentPart = asObject(item);
-    if (!contentPart) {
-      continue;
-    }
-
-    if (context.options.includeImages) {
-      const renderedImage = renderHtmlMessageImage(contentPart, context);
-      if (renderedImage) {
-        imageHtml.push(renderedImage);
-        continue;
-      }
-    }
-
-    if (looksLikeImageContentPart(contentPart)) {
-      continue;
-    }
-
-    if (typeof contentPart.text === "string") {
-      textChunks.push(contentPart.text);
-      continue;
-    }
-
-    if (typeof contentPart.input_text === "string") {
-      textChunks.push(contentPart.input_text);
-      continue;
-    }
-
-    if (typeof contentPart.output_text === "string") {
-      textChunks.push(contentPart.output_text);
-      continue;
-    }
-
-    textChunks.push(prettyStructuredText(contentPart));
-  }
-
-  return {
-    text: stripImagePlaceholderTags(textChunks.map((chunk) => chunk.trim()).filter(Boolean).join("\n\n")),
-    imageHtml,
-  };
-}
-
-function renderHtmlMessageImage(
-  contentPart: Record<string, unknown>,
-  context: HtmlRenderContext,
-): string | null {
-  if (!looksLikeImageContentPart(contentPart)) {
-    return null;
-  }
-
-  const imageSource =
-    typeof contentPart.image_url === "string"
-      ? contentPart.image_url.trim()
-      : typeof contentPart.url === "string"
-        ? contentPart.url.trim()
-        : "";
-  if (!imageSource) {
-    return null;
-  }
-
-  const imageReference = persistHtmlImageReference(imageSource, context);
-  if (!imageReference) {
-    return null;
-  }
-
-  const altText =
-    typeof contentPart.alt_text === "string" && contentPart.alt_text.trim()
-      ? contentPart.alt_text.trim()
-      : `Image ${context.nextImageIndex - 1}`;
-  return `<img src="${escapeHtml(imageReference)}" alt="${escapeHtml(altText)}">`;
-}
-
-function persistHtmlImageReference(
-  imageSource: string,
-  context: HtmlRenderContext,
-): string | null {
-  if (/^data:image\//i.test(imageSource)) {
-    if (context.options.inlineImages) {
-      return imageSource;
-    }
-
-    const asset = createImageAssetFromDataUrl(imageSource, context);
-    if (!asset) {
-      return null;
-    }
-    context.assets.push(asset);
-    return `./${context.assetDirectoryName}/${asset.fileName}`;
-  }
-
-  return imageSource;
 }
 
 function describeHtmlImageMode(options: NormalizedHtmlExportOptions): string {
@@ -3537,182 +2818,17 @@ function escapeHtml(text: string): string {
     .replace(/'/g, "&#039;");
 }
 
-async function buildMarkdownExport(
-  sessionFilePath: string,
-  records: JsonlRecord[],
-  options: NormalizedMarkdownExportOptions,
-  assetDirectoryName: string,
-  runtimeOptions: ExportRuntimeOptions,
-): Promise<{ markdown: string; assets: MarkdownImageAsset[] }> {
-  const sessionMeta = findSessionExportMetadata(records);
-  if (!sessionMeta) {
-    throw new Error(`No session_meta record found in ${sessionFilePath}`);
-  }
-
-  const transcriptSections: string[] = [];
-  let omittedBootstrapMessages = 0;
-  const renderContext: MarkdownRenderContext = {
-    assetDirectoryName,
-    assets: [],
-    nextImageIndex: 1,
-    options,
-  };
-
-  for (let index = 0; index < records.length; index += 1) {
-    const record = records[index];
-    if (record.type !== "response_item") {
-      if (shouldPulseExportProgress(index, records.length)) {
-        await pulseExportLoop(runtimeOptions, index + 1, records.length, {
-          stage: "rendering",
-          startPercent: 32,
-          endPercent: 82,
-          message: "Rendering Markdown transcript...",
-        });
-      }
-      continue;
-    }
-
-    const item = asObject(record.payload);
-    if (!item || typeof item.type !== "string") {
-      continue;
-    }
-
-    const rendered =
-      item.type === "message"
-        ? renderMessageEntry(record, item, renderContext)
-        : options.includeToolCallResults && item.type === "function_call"
-          ? renderToolCallEntry(record, item, "Tool Call")
-          : options.includeToolCallResults && item.type === "function_call_output"
-            ? renderToolOutputEntry(record, item, "Tool Output")
-            : options.includeToolCallResults && item.type === "custom_tool_call"
-              ? renderCustomToolCallEntry(record, item)
-              : options.includeToolCallResults && item.type === "custom_tool_call_output"
-                ? renderCustomToolOutputEntry(record, item)
-                : item.type === "reasoning"
-                  ? renderReasoningEntry(record, item)
-                  : null;
-
-    if (rendered === "bootstrap-omitted") {
-      omittedBootstrapMessages += 1;
-      continue;
-    }
-
-    if (rendered) {
-      transcriptSections.push(rendered);
-    }
-
-    if (shouldPulseExportProgress(index, records.length)) {
-      await pulseExportLoop(runtimeOptions, index + 1, records.length, {
-        stage: "rendering",
-        startPercent: 32,
-        endPercent: 82,
-        message: "Rendering Markdown transcript...",
-      });
-    }
-  }
-
-  await reportExportProgress(runtimeOptions, {
-    stage: "rendering",
-    message: "Markdown transcript rendered.",
-    progressPercent: 82,
-  });
-
-  const headerLines = [
-    "# Codex Session Export",
-    "",
-    `- Source JSONL: \`${sessionFilePath}\``,
-    `- Session ID: \`${sessionMeta.id}\``,
-    `- Started: ${sessionMeta.startedAt ?? "unknown"}`,
-    `- CWD: \`${sessionMeta.cwd}\``,
-    `- Originator: ${sessionMeta.originator ?? "unknown"}`,
-    `- CLI Version: ${sessionMeta.cliVersion ?? "unknown"}`,
-    `- Source: ${sessionMeta.source ?? "unknown"}`,
-    `- Model Provider: ${sessionMeta.modelProvider ?? "unknown"}`,
-    `- Included images: ${options.includeImages ? "yes" : "no"}`,
-    `- Included tool calls and results: ${options.includeToolCallResults ? "yes" : "no"}`,
-    `- Exported: ${new Date().toISOString()}`,
-  ];
-
-  if (omittedBootstrapMessages > 0) {
-    headerLines.push(`- Omitted bootstrap messages: ${omittedBootstrapMessages}`);
-  }
-
-  headerLines.push("", "## Transcript", "");
-
-  if (transcriptSections.length === 0) {
-    headerLines.push("_No transcript items were found in the response stream._", "");
-    return {
-      markdown: headerLines.join("\n"),
-      assets: renderContext.assets,
-    };
-  }
-
-  return {
-    markdown: `${headerLines.join("\n")}${transcriptSections.join("\n\n")}\n`,
-    assets: renderContext.assets,
-  };
-}
-
-function findSessionExportMetadata(records: JsonlRecord[]): SessionExportMetadata | null {
-  for (const record of records) {
-    if (record.type !== "session_meta") {
-      continue;
-    }
-
-    const payload = asObject(record.payload);
-    if (!payload || typeof payload.id !== "string" || typeof payload.cwd !== "string") {
-      continue;
-    }
-
-    return {
-      id: payload.id,
-      startedAt:
-        typeof payload.timestamp === "string"
-          ? payload.timestamp
-          : typeof record.timestamp === "string"
-            ? record.timestamp
-            : null,
-      cwd: payload.cwd,
-      originator: typeof payload.originator === "string" ? payload.originator : null,
-      cliVersion: typeof payload.cli_version === "string" ? payload.cli_version : null,
-      source: typeof payload.source === "string" ? payload.source : null,
-      modelProvider:
-        typeof payload.model_provider === "string" ? payload.model_provider : null,
-    };
-  }
-
-  return null;
-}
-
 function renderMessageEntry(
   record: JsonlRecord,
   item: Record<string, unknown>,
-  context: MarkdownRenderContext,
-): string | "bootstrap-omitted" | null {
+  context: ExportRenderContext,
+): string | null {
   const role = typeof item.role === "string" ? item.role : "unknown";
-  if (role === "developer") {
-    return null;
-  }
-
-  const renderedContent = renderMessageContent(item.content, context);
-  if (!renderedContent.text && renderedContent.imageMarkdown.length === 0) {
-    return null;
-  }
-
-  if (role === "user" && looksLikeBootstrapContext(renderedContent.text)) {
-    return "bootstrap-omitted";
-  }
-
+  const content = renderMessageContent(item.content, context);
+  if (!content) return null;
   const phase = typeof item.phase === "string" ? ` [${item.phase}]` : "";
-  const sections: string[] = [];
-  if (renderedContent.text) {
-    sections.push(renderedContent.text);
-  }
-  if (renderedContent.imageMarkdown.length > 0) {
-    sections.push(renderedContent.imageMarkdown.join("\n\n"));
-  }
-
-  return `### ${formatTimestamp(record.timestamp)} ${toTitleCase(role)}${phase}\n\n${sections.join("\n\n")}`;
+  const heading = `${formatTimestamp(record.timestamp)} ${toTitleCase(role)}${phase}`;
+  return `### ${escapeMarkdownText(heading)}\n\n${content}`;
 }
 
 function renderToolCallEntry(
@@ -3723,7 +2839,7 @@ function renderToolCallEntry(
   const toolName = typeof item.name === "string" ? item.name : "unknown-tool";
   const argumentsText = prettyStructuredText(item.arguments);
   return [
-    `### ${formatTimestamp(record.timestamp)} ${label}: ${toolName}`,
+    `### ${escapeMarkdownText(`${formatTimestamp(record.timestamp)} ${label}: ${toolName}`)}`,
     "",
     renderCodeBlock(argumentsText, "json"),
   ].join("\n");
@@ -3737,7 +2853,7 @@ function renderToolOutputEntry(
   const callId = typeof item.call_id === "string" ? ` (${item.call_id})` : "";
   const outputText = prettyStructuredText(item.output);
   return [
-    `### ${formatTimestamp(record.timestamp)} ${label}${callId}`,
+    `### ${escapeMarkdownText(`${formatTimestamp(record.timestamp)} ${label}${callId}`)}`,
     "",
     renderCodeBlock(outputText, "text"),
   ].join("\n");
@@ -3751,7 +2867,7 @@ function renderCustomToolCallEntry(
   const status = typeof item.status === "string" ? ` [${item.status}]` : "";
   const inputText = prettyStructuredText(item.input);
   return [
-    `### ${formatTimestamp(record.timestamp)} Custom Tool Call: ${toolName}${status}`,
+    `### ${escapeMarkdownText(`${formatTimestamp(record.timestamp)} Custom Tool Call: ${toolName}${status}`)}`,
     "",
     renderCodeBlock(inputText, "text"),
   ].join("\n");
@@ -3764,7 +2880,7 @@ function renderCustomToolOutputEntry(
   const callId = typeof item.call_id === "string" ? ` (${item.call_id})` : "";
   const outputText = prettyStructuredText(item.output);
   return [
-    `### ${formatTimestamp(record.timestamp)} Custom Tool Output${callId}`,
+    `### ${escapeMarkdownText(`${formatTimestamp(record.timestamp)} Custom Tool Output${callId}`)}`,
     "",
     renderCodeBlock(outputText, "text"),
   ].join("\n");
@@ -3781,13 +2897,9 @@ function renderReasoningEntry(
     return null;
   }
 
-  return `### ${formatTimestamp(record.timestamp)} Reasoning Summary\n\n${summaries
+  return `### ${escapeMarkdownText(formatTimestamp(record.timestamp))} Reasoning Summary\n\n${summaries
     .map((summary) => `- ${summary}`)
     .join("\n")}`;
-}
-
-function numberMarkdownTranscriptEntry(section: string, index: number): string {
-  return section.replace(/^###\s+/, `### ${index}. `);
 }
 
 function extractReasoningSummaryText(entry: unknown): string {
@@ -3807,70 +2919,29 @@ function extractReasoningSummaryText(entry: unknown): string {
   return "";
 }
 
-function renderMessageContent(
-  content: unknown,
-  context: MarkdownRenderContext,
-): RenderedMessageContent {
-  if (!Array.isArray(content)) {
-    return {
-      text: "",
-      imageMarkdown: [],
-    };
-  }
-
-  const textChunks: string[] = [];
-  const imageMarkdown: string[] = [];
-
-  for (const item of content) {
-    if (typeof item === "string") {
-      textChunks.push(item);
-      continue;
-    }
-
-    const contentPart = asObject(item);
-    if (!contentPart) {
-      continue;
-    }
-
-    if (context.options.includeImages) {
-      const renderedImage = renderMessageImage(contentPart, context);
-      if (renderedImage) {
-        imageMarkdown.push(renderedImage);
-        continue;
+function renderMessageContent(content: unknown, context: ExportRenderContext): string {
+  const parts = typeof content === "string" ? [content] : Array.isArray(content) ? content : [];
+  const rendered: string[] = [];
+  for (const value of parts) {
+    const part = asObject(value);
+    if (part && looksLikeImageContentPart(part)) {
+      if (context.options.includeImages) {
+        const image = renderMessageImage(part, context);
+        if (image) rendered.push(image);
       }
-    }
-
-    if (looksLikeImageContentPart(contentPart)) {
       continue;
     }
-
-    if (typeof contentPart.text === "string") {
-      textChunks.push(contentPart.text);
-      continue;
-    }
-
-    if (typeof contentPart.input_text === "string") {
-      textChunks.push(contentPart.input_text);
-      continue;
-    }
-
-    if (typeof contentPart.output_text === "string") {
-      textChunks.push(contentPart.output_text);
-      continue;
-    }
-
-    textChunks.push(prettyStructuredText(contentPart));
+    const text = typeof value === "string" ? value
+      : part ? part.text ?? part.input_text ?? part.output_text ?? prettyStructuredText(part) : "";
+    if (typeof text !== "string" || !text.trim()) continue;
+    // Preserve indentation, blank lines, and the position of each image.
+    const cleaned = text.replace(/^[ \t]*<\/?image>[ \t]*\r?$/gim, "");
+    if (!cleaned.trim()) continue;
+    rendered.push(context.format === "html"
+      ? `<div class="message-text">${escapeHtml(cleaned)}</div>`
+      : stabilizeExportText(cleaned));
   }
-
-  return {
-    text: stripImagePlaceholderTags(
-      textChunks
-    .map((chunk) => chunk.trim())
-      .filter(Boolean)
-      .join("\n\n"),
-    ),
-    imageMarkdown,
-  };
+  return rendered.join("\n\n");
 }
 
 function stripImagePlaceholderTags(text: string): string {
@@ -3881,6 +2952,9 @@ function stripImagePlaceholderTags(text: string): string {
 }
 
 function extractMessageLikeText(content: unknown): string {
+  if (typeof content === "string") {
+    return stripImagePlaceholderTags(content);
+  }
   if (!Array.isArray(content)) {
     return "";
   }
@@ -3924,87 +2998,68 @@ function extractMessageLikeText(content: unknown): string {
 }
 
 function renderMessageImage(
-  contentPart: Record<string, unknown>,
-  context: MarkdownRenderContext,
+  part: Record<string, unknown>,
+  context: ExportRenderContext,
 ): string | null {
-  if (!looksLikeImageContentPart(contentPart)) {
-    return null;
-  }
-
-  const imageSource =
-    typeof contentPart.image_url === "string"
-      ? contentPart.image_url.trim()
-      : typeof contentPart.url === "string"
-        ? contentPart.url.trim()
-        : "";
-  if (!imageSource) {
-    return null;
-  }
-
-  const imageReference = persistImageReference(imageSource, context);
-  if (!imageReference) {
-    return null;
-  }
-
-  const altText =
-    typeof contentPart.alt_text === "string" && contentPart.alt_text.trim()
-      ? contentPart.alt_text.trim()
-      : `Image ${context.nextImageIndex - 1}`;
-  return `![${escapeMarkdownText(altText)}](${imageReference})`;
-}
-
-function looksLikeImageContentPart(contentPart: Record<string, unknown>): boolean {
-  const partType = typeof contentPart.type === "string" ? contentPart.type.toLowerCase() : "";
-  return (
-    partType.includes("image") ||
-    typeof contentPart.image_url === "string" ||
-    typeof contentPart.url === "string"
-  );
-}
-
-function persistImageReference(
-  imageSource: string,
-  context: MarkdownRenderContext,
-): string | null {
-  if (/^data:image\//i.test(imageSource)) {
-    const asset = createImageAssetFromDataUrl(imageSource, context);
-    if (!asset) {
+  const source = getImageSource(part);
+  if (!source) return null;
+  let reference: string;
+  if (/^data:/i.test(source)) {
+    const asset = createImageAssetFromDataUrl(source, context.nextImageIndex);
+    if (!asset) return null;
+    if (context.options.inlineImages) {
+      reference = source;
+    } else {
+      context.assets.push(asset);
+      reference = `./${context.assetDirectoryName.split("/").map(encodeUrlSegment).join("/")}/${asset.fileName}`;
+    }
+  } else {
+    // Local and executable schemes are not portable transcript attachments.
+    try {
+      const url = new URL(source);
+      if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+      reference = url.href.replace(/[()'<>]/g, encodeUrlSegment);
+    } catch {
       return null;
     }
-
-    context.assets.push(asset);
-    return `./${context.assetDirectoryName}/${asset.fileName}`;
   }
-
-  return imageSource;
+  const index = context.nextImageIndex++;
+  const alt = typeof part.alt_text === "string" && part.alt_text.trim()
+    ? part.alt_text : `Image ${index}`;
+  return context.format === "html"
+    ? `<img src="${escapeHtml(reference)}" alt="${escapeHtml(alt)}" loading="lazy" referrerpolicy="no-referrer">`
+    : `![${escapeMarkdownText(alt)}](${reference})`;
 }
 
-function createImageAssetFromDataUrl(
-  dataUrl: string,
-  context: { nextImageIndex: number },
-): ExportImageAsset | null {
-  const match = dataUrl.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/i);
-  if (!match) {
-    return null;
-  }
+function getImageSource(part: Record<string, unknown>): string | null {
+  const imageUrl = asObject(part.image_url);
+  const source = typeof part.image_url === "string" ? part.image_url
+    : typeof imageUrl?.url === "string" ? imageUrl.url
+    : typeof part.url === "string" ? part.url
+    : typeof part.data === "string" && typeof part.mimeType === "string"
+      ? `data:${part.mimeType};base64,${part.data}` : null;
+  return source?.trim() || null;
+}
 
-  const mimeType = (match[1] ?? "image/png").toLowerCase();
-  const extension = extensionForMimeType(mimeType);
-  if (!extension) {
-    return null;
-  }
+function looksLikeImageContentPart(part: Record<string, unknown>): boolean {
+  const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
+  return type === "image" || type === "input_image" || type === "output_image" ||
+    type === "image_url" || part.image_url !== undefined;
+}
 
-  try {
-    const data = Uint8Array.from(Buffer.from(match[2], "base64"));
-    const fileName = `image-${String(context.nextImageIndex).padStart(3, "0")}.${extension}`;
-    context.nextImageIndex += 1;
-    return {
-      fileName,
-      data,
-    };
-  } catch {
-    return null;
-  }
+function createImageAssetFromDataUrl(dataUrl: string, index: number): ExportImageAsset | null {
+  const match = dataUrl.match(/^data:(image\/[^;,]+);base64,([a-z0-9+/]+={0,2})$/i);
+  if (!match) return null;
+  const extension = extensionForMimeType(match[1].toLowerCase());
+  if (!extension) return null;
+  const data = Buffer.from(match[2], "base64");
+  if (data.length === 0 || data.toString("base64").replace(/=+$/, "") !== match[2].replace(/=+$/, "")) return null;
+  return { fileName: `image-${String(index).padStart(3, "0")}.${extension}`, data: Uint8Array.from(data) };
+}
+
+function encodeUrlSegment(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, character =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
 function extensionForMimeType(mimeType: string): string | null {
@@ -4025,7 +3080,9 @@ function extensionForMimeType(mimeType: string): string | null {
 }
 
 function escapeMarkdownText(value: string): string {
-  return value.replace(/[\\[\]()]/g, "\\$&");
+  return stabilizeExportText(value).replace(/\s+/g, " ")
+    .replace(/[\\`*_[\]{}()]/g, "\\$&")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;");
 }
 
 function stabilizeExportText(value: string): string {
@@ -4106,10 +3163,10 @@ function prettyStructuredText(value: unknown): string {
 
 function renderCodeBlock(text: string, language: string): string {
   const stabilizedText = stabilizeExportText(text || "(empty)");
-  const longestFenceRun = Math.max(
-    0,
-    ...Array.from(stabilizedText.matchAll(/~+/g), (match) => match[0].length),
-  );
+  let longestFenceRun = 0;
+  for (const match of stabilizedText.matchAll(/~+/g)) {
+    longestFenceRun = Math.max(longestFenceRun, match[0].length);
+  }
   const fence = "~".repeat(Math.max(3, longestFenceRun + 1));
   return `${fence}${language}\n${stabilizedText}\n${fence}`;
 }

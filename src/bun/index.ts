@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { BrowserView, BrowserWindow, Updater, Utils } from "electrobun/bun";
+import { BrowserView, BrowserWindow, Updater, Utils } from "electrobun/main";
 import {
   DEFAULT_CODEX_HOME,
   type ExportProgress,

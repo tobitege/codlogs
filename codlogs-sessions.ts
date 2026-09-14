@@ -34,6 +34,7 @@ async function main(): Promise<void> {
   if (options.htmlExportPath !== null) {
     const htmlPath = await exportSessionJsonlToHtml(options.htmlExportPath, {
       includeImages: options.includeImages,
+      inlineImages: false,
       includeToolCallResults: options.includeToolCallResults,
     });
     console.log(`Wrote HTML export: ${htmlPath}`);

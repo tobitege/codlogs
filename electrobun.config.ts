@@ -4,9 +4,13 @@ export default {
   app: {
     name: "codlogs",
     identifier: "dev.tobitege.codlogs",
-    version: "1.3.2",
+    version: "1.4.0",
   },
   build: {
+    mainProcess: "bun",
+    bun: {
+      entrypoint: "src/bun/index.ts",
+    },
     copy: {
       "dist/index.html": "views/mainview/index.html",
       "dist/assets": "views/mainview/assets",
