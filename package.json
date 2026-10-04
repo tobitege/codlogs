@@ -43,7 +43,7 @@
   },
   "devDependencies": {
     "electrobun": "2.0.1",
-    "@types/bun": "1.4.1",
+    "@types/bun": "1.4.2",
     "@types/react": "19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "6.1.1",
