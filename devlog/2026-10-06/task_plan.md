@@ -6,3 +6,5 @@
 - Run the documented typecheck, regression tests, and web build sequentially.
 
 Status: Complete. Updated eligible tooling and transitive packages; all checks passed.
+
+Follow-up: Increase the patch version to 1.4.1 and document changes since the v1.4.0 release in README.

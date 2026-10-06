@@ -192,6 +192,13 @@ Compatibility notes:
 
 ## Changelog
 
+### [1.4.1] - 2026-10-06
+
+- Updated React and React DOM to 19.3.0, Vite to 8.3.1, and the Bun and React type packages.
+- Updated transitive dependencies within their allowed ranges. All updated npm package versions are at least seven days old.
+- Updated Bun in the package metadata and workflows to 1.4.2. Updated Node 22 in the workflows to 22.23.3.
+- Updated the checkout and setup-node GitHub Actions to v7.
+
 ### [1.4.0] - 2026-09-14
 
 - Preserve existing exports and images when an export is cancelled or fails. Publish completed transcripts atomically and isolate image files per export.

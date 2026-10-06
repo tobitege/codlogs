@@ -8,3 +8,5 @@
 - Verified frozen installation, typecheck, all 55 tests, and the web build with portable Bun 1.4.2.
 - Rechecked every final locked package publication date; all 93 package/version pairs qualify.
 - No portable Bun processes remain. The user requested an English commit explanation and a push to origin after validation.
+- Committed the dependency updates as 1e9c61f and pushed main to origin.
+- Increased the package and desktop app versions from 1.4.0 to 1.4.1. Added the README changelog entry for changes since v1.4.0.
