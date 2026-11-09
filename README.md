@@ -192,6 +192,11 @@ Compatibility notes:
 
 ## Changelog
 
+### [1.4.2] - 2026-11-09
+
+- Updated Vite to 8.3.4, which fixes the open Vite and launch-editor security advisories.
+- Updated Electrobun to 2.0.2, @vitejs/plugin-react to 6.1.2, concurrently to 10.0.6 and @types/bun to 1.4.3.
+
 ### [1.4.1] - 2026-10-06
 
 - Updated React and React DOM to 19.3.0, Vite to 8.3.1, and the Bun and React type packages.

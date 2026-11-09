@@ -4,7 +4,7 @@ export default {
   app: {
     name: "codlogs",
     identifier: "dev.tobitege.codlogs",
-    version: "1.4.1",
+    version: "1.4.2",
   },
   build: {
     mainProcess: "bun",
