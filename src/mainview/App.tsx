@@ -822,7 +822,7 @@ function getExportDestinationHint(
   }
 
   if (format === "opencode") {
-    return "Choose a folder and codlogs will write the .opencode.json session file into it. Import it with: opencode session import <file>";
+    return "Choose a folder and codlogs will write the .opencode.json session file into it. To import it in OpenCode, open the ⋯ menu of a project in the sidebar and choose Import session, or run: opencode session import <file>";
   }
 
   return htmlExportUsesFilePicker(includeImages, inlineImages)

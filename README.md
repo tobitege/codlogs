@@ -198,10 +198,14 @@ codlogs can write a Codex session as a session file for [OpenCode](https://openc
 
 ```powershell
 codlogs --opencode C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl --include-images --include-tool-results
-opencode session import C:\Users\tobitege\.codex\sessions\2026\03\06\session.opencode.json --directory D:\github\myproject
 ```
 
-The file is written next to the session as `<session>.opencode.json`, or into the folder chosen in the desktop app. OpenCode attaches the imported session to the project of `--directory`, or of the current folder without it.
+The file is written next to the session as `<session>.opencode.json`, or into the folder chosen in the desktop app.
+
+Import the file in OpenCode in one of two ways:
+
+- In the OpenCode desktop app: in the sidebar under `Projects`, open the `⋯` menu (`More options`) of the project the session should belong to, choose `Import session` and pick the file.
+- On the command line: `opencode session import <file> --directory <project folder>`. OpenCode attaches the session to the project of `--directory`, or of the current folder without it. With only the desktop app installed, `opencode` is not on the PATH; on Windows its command line program is `%LOCALAPPDATA%\Programs\ai.opencode.desktop\resources\opencode-cli.exe`.
 
 What the file contains:
 

@@ -51,6 +51,7 @@ async function main(): Promise<void> {
     });
     console.log(`Wrote OpenCode session file: ${openCodePath}`);
     console.log(`Import it with: opencode session import "${openCodePath}"`);
+    console.log("Or in the OpenCode desktop app: open the More options menu of a project in the sidebar and choose Import session.");
     return;
   }
 
