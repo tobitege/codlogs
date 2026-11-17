@@ -55,7 +55,7 @@ type SanitizedCopyState = {
   outputPath: string | null;
 };
 
-type ExportFormat = "markdown" | "html";
+type ExportFormat = "markdown" | "html" | "opencode";
 
 type ExportDialogState = {
   format: ExportFormat;
@@ -763,7 +763,14 @@ function useTimedActionState<TState extends string>(
 }
 
 function formatExportLabel(format: ExportFormat): string {
-  return format === "markdown" ? "Markdown" : "HTML";
+  switch (format) {
+    case "markdown":
+      return "Markdown";
+    case "html":
+      return "HTML";
+    default:
+      return "OpenCode";
+  }
 }
 
 function formatExportStateTitle(kind: ExportState["kind"]): string {
@@ -812,6 +819,10 @@ function getExportDestinationHint(
 ): string {
   if (format === "markdown") {
     return "Choose a folder and codlogs will write the Markdown file into it.";
+  }
+
+  if (format === "opencode") {
+    return "Choose a folder and codlogs will write the .opencode.json session file into it. Import it with: opencode session import <file>";
   }
 
   return htmlExportUsesFilePicker(includeImages, inlineImages)
@@ -1392,7 +1403,7 @@ function App() {
     const label = formatExportLabel(format);
 
     try {
-      if (format === "markdown") {
+      if (format === "markdown" || format === "opencode") {
         const response = await getRpc().request.pickExportDirectory({
           sessionFilePath: activeSession.file,
         });
@@ -1443,6 +1454,15 @@ function App() {
       if (format === "markdown") {
         const { jobId } = await getRpc().request.startSessionMarkdownExport({
           sessionFilePath: activeSession.file,
+          includeImages: exportImages,
+          includeToolCallResults: exportToolCallResults,
+          outputDirectory,
+        });
+        activeExportJobIdRef.current = jobId;
+      } else if (format === "opencode") {
+        const { jobId } = await getRpc().request.startSessionOpenCodeExport({
+          sessionFilePath: activeSession.file,
+          codexHome: codexHome.trim() || null,
           includeImages: exportImages,
           includeToolCallResults: exportToolCallResults,
           outputDirectory,
@@ -2159,6 +2179,15 @@ function App() {
                       type="button"
                     >
                       Export HTML
+                    </button>
+                    <button
+                      className="primary-button"
+                      disabled={exportState.kind === "working" || sanitizedCopyState.kind === "working"}
+                      onClick={() => openExportDialog("opencode")}
+                      title="Write a session file for `opencode session import` (OpenCode 2)"
+                      type="button"
+                    >
+                      Export OpenCode
                     </button>
                   </div>
                 </div>
@@ -3155,7 +3184,11 @@ function ExportDialog(props: {
             />
             <span className="dialog-option-copy">
               <strong>Include captured images</strong>
-              <small>Render image attachments from the session into the export.</small>
+              <small>
+                {props.format === "opencode"
+                  ? "Embed image attachments in the session file."
+                  : "Render image attachments from the session into the export."}
+              </small>
             </span>
           </label>
 
@@ -3188,7 +3221,11 @@ function ExportDialog(props: {
             />
             <span className="dialog-option-copy">
               <strong>Include tool calls and results</strong>
-              <small>Append tool invocations and outputs to the exported transcript.</small>
+              <small>
+                {props.format === "opencode"
+                  ? "Keep tool invocations and outputs, so OpenCode can continue with the full context."
+                  : "Append tool invocations and outputs to the exported transcript."}
+              </small>
             </span>
           </label>
         </div>
@@ -3196,7 +3233,7 @@ function ExportDialog(props: {
         <div className="dialog-destination">
           <span className="dialog-destination-label">Destination</span>
           <strong>
-            {props.format === "markdown"
+            {props.format === "markdown" || props.format === "opencode"
               ? "Choose a folder"
               : htmlUsesFilePicker
                 ? "Save as .html file"

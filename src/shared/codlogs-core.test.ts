@@ -9,6 +9,7 @@ import {
   MAX_JSONL_LINE_BYTES_HARD,
   exportSessionJsonlToHtml,
   exportSessionJsonlToMarkdown,
+  exportSessionJsonlToOpenCode,
   findCodexSessions,
   getSessionDetailMetrics,
   mergeErroredToolCallPatterns,
@@ -22,6 +23,7 @@ import {
   formatCodexRolloutTimestamp,
   generateUuidV7String,
 } from "./codex-rollout.ts";
+import { buildOpenCodeIdentifier } from "./opencode-session.ts";
 import {
   type OriginalResponseItemSlot,
   type SanitizedResponseItem,
@@ -1489,5 +1491,350 @@ describe("large-session hardening", () => {
         payload: responseItems[0],
       },
     ]);
+  });
+});
+
+describe("OpenCode session export", () => {
+  const png = "iVBORw0KGgo=";
+  const pngUrl = `data:image/png;base64,${png}`;
+  const at = (seconds: number) => Date.UTC(2026, 10, 17, 10, 0, seconds);
+  const iso = (seconds: number) => new Date(at(seconds)).toISOString();
+  const item = (seconds: number, payload: Record<string, unknown>) =>
+    ({ type: "response_item", timestamp: iso(seconds), payload });
+  const event = (seconds: number, type: string, extra: Record<string, unknown> = {}) =>
+    ({ type: "event_msg", timestamp: iso(seconds), payload: { type, ...extra } });
+  const text = (value: string) => ({ type: "input_text", text: value });
+  const user = (seconds: number, ...content: unknown[]) =>
+    item(seconds, { type: "message", role: "user", content });
+  const assistant = (seconds: number, value: string) =>
+    item(seconds, { type: "message", role: "assistant", content: [{ type: "output_text", text: value }] });
+  const call = (seconds: number, callId: string, name = "shell", args: unknown = { command: ["ls"] }) =>
+    item(seconds, { type: "function_call", name, call_id: callId, arguments: JSON.stringify(args) });
+  const output = (seconds: number, callId: string, value: unknown) =>
+    item(seconds, { type: "function_call_output", call_id: callId, output: value });
+  const model = { id: "gpt-test", providerID: "openai" };
+  const turnContext = { type: "turn_context", timestamp: iso(1), payload: { model: "gpt-test", effort: "high" } };
+
+  async function writeSession(rows: unknown[]): Promise<string> {
+    const directory = await createTempDir("codlogs-opencode-");
+    const file = path.join(directory, "rollout.jsonl");
+    const meta = {
+      type: "session_meta",
+      timestamp: iso(0),
+      payload: {
+        id: "codex-session-1", cwd: "D:\\github\\demo", timestamp: iso(0),
+        model_provider: "openai", cli_version: "0.99.0",
+      },
+    };
+    await fs.writeFile(file, `${[meta, ...rows].map(row => JSON.stringify(row)).join("\n")}\n`);
+    return file;
+  }
+
+  async function exportRows(
+    rows: unknown[],
+    options: Parameters<typeof exportSessionJsonlToOpenCode>[1] = {},
+  ): Promise<{ info: any; messages: any[] }> {
+    const outputPath = await exportSessionJsonlToOpenCode(await writeSession(rows), options);
+    expect(path.basename(outputPath)).toBe("rollout.opencode.json");
+    const data = JSON.parse(await fs.readFile(outputPath, "utf8"));
+    expectImportable(data);
+    return data;
+  }
+
+  const withoutIds = (messages: any[]) => messages.map(({ id: _id, ...message }) => message);
+
+  // Mirrors what the OpenCode 2.3 importer requires of SessionTransfer.Data.
+  function expectImportable(data: any): void {
+    const isTime = (value: unknown) => typeof value === "number" && Number.isFinite(value);
+    const isBase64 = (value: string) => value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value);
+    expect(Object.keys(data).sort()).toEqual(["info", "messages"]);
+    expect(data.info.id).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect(typeof data.info.projectID).toBe("string");
+    expect(typeof data.info.location.directory).toBe("string");
+    expect(isTime(data.info.time.created) && isTime(data.info.time.updated)).toBe(true);
+    const { tokens } = data.info;
+    for (const count of [data.info.cost, tokens.input, tokens.output, tokens.reasoning, tokens.cache.read, tokens.cache.write]) {
+      expect(Number.isFinite(count)).toBe(true);
+    }
+    const ids: string[] = data.messages.map((message: any) => message.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual([...ids].sort());
+    for (const message of data.messages) {
+      expect(message.id).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+      expect(isTime(message.time.created)).toBe(true);
+      if (message.type === "user") {
+        expect(typeof message.text).toBe("string");
+        for (const file of message.files ?? []) {
+          expect(isBase64(file.data)).toBe(true);
+          expect(typeof file.mime).toBe("string");
+          expect(file.source).toEqual({ type: "inline" });
+        }
+      } else if (message.type === "assistant") {
+        expect(typeof message.agent).toBe("string");
+        expect(typeof message.model.id).toBe("string");
+        expect(typeof message.model.providerID).toBe("string");
+        // The importer drops an assistant message that has no completion time.
+        expect(isTime(message.time.completed)).toBe(true);
+        expect(["stop", "tool-calls"]).toContain(message.finish);
+        for (const part of message.content) {
+          if (part.type === "tool") {
+            expect(typeof part.id).toBe("string");
+            expect(typeof part.name).toBe("string");
+            expect(isTime(part.time.created)).toBe(true);
+            expect(Array.isArray(part.state.input)).toBe(false);
+            expect(typeof part.state.input).toBe("object");
+            if (part.state.status === "completed") {
+              expect(part.state.content.length).toBeGreaterThan(0);
+            } else {
+              expect(part.state.status).toBe("error");
+              expect(typeof part.state.error.type).toBe("string");
+              expect(typeof part.state.error.message).toBe("string");
+            }
+          } else {
+            expect(["text", "reasoning"]).toContain(part.type);
+            expect(typeof part.text).toBe("string");
+          }
+        }
+      } else if (message.type === "compaction") {
+        expect(message.status).toBe("completed");
+        expect(message.reason).toBe("auto");
+        expect(typeof message.summary).toBe("string");
+      } else {
+        expect(message.type).toBe("idle");
+        expect(["succeeded", "failed", "interrupted"]).toContain(message.outcome);
+      }
+    }
+  }
+
+  const transcript = [
+    item(1, { type: "message", role: "developer", content: [text("You are Codex.")] }),
+    user(1, text("# AGENTS.md instructions\n\nBe careful.")),
+    turnContext,
+    event(1, "task_started"),
+    user(2, text("<image name=[Image #1]>"), { type: "input_image", image_url: pngUrl }, text("</image>"), text("  Fix the bug\nplease")),
+    item(3, { type: "reasoning", summary: [{ type: "summary_text", text: "Plan the fix" }], encrypted_content: "opaque" }),
+    assistant(4, "Looking at the file."),
+    call(5, "call_1"),
+    output(6, "call_1", "file.txt"),
+    event(6, "token_count", {
+      info: { total_token_usage: {
+        input_tokens: 1000, cached_input_tokens: 400, output_tokens: 300, reasoning_output_tokens: 100, total_tokens: 1300,
+      } },
+    }),
+    item(7, { type: "custom_tool_call", name: "apply_patch", call_id: "call_2", input: "*** Begin Patch" }),
+    item(8, {
+      type: "custom_tool_call_output", call_id: "call_2",
+      output: [text("Done"), { type: "input_image", image_url: pngUrl }],
+    }),
+    assistant(9, "Fixed."),
+    event(10, "task_complete"),
+  ];
+
+  test("maps prompts, model responses, tool calls and turn ends", async () => {
+    const data = await exportRows(transcript, { includeImages: true, includeToolCallResults: true });
+
+    expect(withoutIds(data.messages)).toEqual([
+      {
+        type: "user", time: { created: at(2) }, text: "  Fix the bug\nplease",
+        files: [{ data: png, mime: "image/png", source: { type: "inline" }, name: "image-001.png" }],
+      },
+      {
+        type: "assistant", time: { created: at(3), completed: at(6) }, agent: "build", model, finish: "tool-calls",
+        content: [
+          { type: "reasoning", text: "Plan the fix" },
+          { type: "text", text: "Looking at the file." },
+          {
+            type: "tool", id: "call_1", name: "shell", time: { created: at(5), ran: at(5), completed: at(6) },
+            state: { status: "completed", input: { command: ["ls"] }, content: [{ type: "text", text: "file.txt" }] },
+          },
+        ],
+      },
+      {
+        type: "assistant", time: { created: at(7), completed: at(8) }, agent: "build", model, finish: "tool-calls",
+        content: [{
+          type: "tool", id: "call_2", name: "apply_patch", time: { created: at(7), ran: at(7), completed: at(8) },
+          state: {
+            status: "completed", input: { input: "*** Begin Patch" },
+            content: [
+              { type: "text", text: "Done" },
+              { type: "file", uri: pngUrl, mime: "image/png", name: "image-002.png" },
+            ],
+          },
+        }],
+      },
+      {
+        type: "assistant", time: { created: at(9), completed: at(9) }, agent: "build", model, finish: "stop",
+        content: [{ type: "text", text: "Fixed." }],
+      },
+      { type: "idle", time: { created: at(10) }, outcome: "succeeded" },
+    ]);
+    expect(data.info).toEqual({
+      id: data.info.id,
+      projectID: "global",
+      model,
+      cost: 0,
+      tokens: { input: 600, output: 200, reasoning: 100, cache: { read: 400, write: 0 } },
+      outcome: "succeeded",
+      time: { created: at(0), updated: at(10), idle: at(10), viewed: at(10) },
+      title: "Fix the bug",
+      location: { directory: "D:\\github\\demo" },
+      metadata: { source: "codex", codexSessionId: "codex-session-1", codexCliVersion: "0.99.0", exportedBy: "codlogs" },
+    });
+  });
+
+  test("leaves out images and tool calls unless they are requested", async () => {
+    const data = await exportRows(transcript);
+
+    expect(withoutIds(data.messages)).toEqual([
+      { type: "user", time: { created: at(2) }, text: "  Fix the bug\nplease" },
+      {
+        type: "assistant", time: { created: at(3), completed: at(9) }, agent: "build", model, finish: "stop",
+        content: [
+          { type: "reasoning", text: "Plan the fix" },
+          { type: "text", text: "Looking at the file." },
+          { type: "text", text: "Fixed." },
+        ],
+      },
+      { type: "idle", time: { created: at(10) }, outcome: "succeeded" },
+    ]);
+  });
+
+  test("marks interrupted turns and tool calls without an output", async () => {
+    const data = await exportRows([
+      turnContext,
+      event(1, "task_started"),
+      user(2, text("Run it")),
+      call(3, "call_1"),
+      call(3, "call_2"),
+      output(4, "call_2", { content: "second", success: true }),
+      output(4, "call_unknown", "ignored"),
+      event(5, "turn_aborted", { reason: "interrupted" }),
+      event(6, "task_started"),
+      user(7, text("Again")),
+    ], { includeToolCallResults: true });
+
+    const error = { type: "aborted", message: "No tool output was recorded in the Codex session." };
+    expect(withoutIds(data.messages)).toEqual([
+      { type: "user", time: { created: at(2) }, text: "Run it" },
+      {
+        type: "assistant", time: { created: at(3), completed: at(4) }, agent: "build", model, finish: "tool-calls",
+        content: [
+          {
+            type: "tool", id: "call_1", name: "shell", time: { created: at(3), ran: at(3), completed: at(5) },
+            state: { status: "error", input: { command: ["ls"] }, error },
+          },
+          {
+            type: "tool", id: "call_2", name: "shell", time: { created: at(3), ran: at(3), completed: at(4) },
+            state: { status: "completed", input: { command: ["ls"] }, content: [{ type: "text", text: "second" }] },
+          },
+        ],
+      },
+      { type: "idle", time: { created: at(5) }, outcome: "interrupted" },
+      { type: "user", time: { created: at(7) }, text: "Again" },
+      // Codex never closed the last turn.
+      { type: "idle", time: { created: at(7) }, outcome: "interrupted" },
+    ]);
+    expect(data.info.outcome).toBe("interrupted");
+    expect(data.info.time.idle).toBe(at(7));
+  });
+
+  test("ends each answered prompt of a session without turn events", async () => {
+    const data = await exportRows([
+      user(1, text("First")), assistant(2, "One"),
+      user(3, text("Second")), assistant(4, "Two"),
+    ]);
+
+    expect(data.messages.map(message => `${message.type}:${message.text ?? message.outcome ?? message.content[0].text}`))
+      .toEqual(["user:First", "assistant:One", "idle:succeeded", "user:Second", "assistant:Two", "idle:succeeded"]);
+    // No turn_context row named a model.
+    expect(data.messages[1].model).toEqual({ id: "unknown", providerID: "openai" });
+    expect(data.info.model).toBeUndefined();
+    expect(data.info.title).toBe("First");
+  });
+
+  test("keeps a readable compaction summary and skips an opaque one", async () => {
+    const data = await exportRows([
+      user(1, text("First")), assistant(2, "One"),
+      { type: "compacted", timestamp: iso(3), payload: { message: "Summary of the work so far" } },
+      { type: "compacted", timestamp: iso(4), payload: { message: "", replacement_history: [{}] } },
+      assistant(5, "Two"),
+    ]);
+
+    expect(withoutIds(data.messages)[2]).toEqual({
+      type: "compaction", time: { created: at(3) }, status: "completed", reason: "auto",
+      summary: "Summary of the work so far",
+    });
+    expect(data.messages.map(message => message.type))
+      .toEqual(["user", "assistant", "compaction", "assistant", "idle"]);
+  });
+
+  test("embeds only valid inline images and pads their base64 data", async () => {
+    const data = await exportRows([
+      user(
+        1,
+        text("Look"),
+        { type: "input_image", image_url: "data:image/png;base64,iVBORw0KGgo" },
+        { type: "input_image", image_url: "data:image/png;base64,@@@@" },
+        { type: "input_image", image_url: "https://example.com/picture.png" },
+        { type: "input_image", image_url: "data:text/html;base64,PGI+" },
+        { type: "input_image", image_url: { url: "data:image/jpeg;base64,/9j/4AAQ" } },
+      ),
+    ], { includeImages: true });
+
+    expect(data.messages[0].files).toEqual([
+      { data: png, mime: "image/png", source: { type: "inline" }, name: "image-001.png" },
+      { data: "/9j/4AAQ", mime: "image/jpeg", source: { type: "inline" }, name: "image-002.jpg" },
+    ]);
+  });
+
+  test("names the session after the Codex thread and repeats identifiers for the same session", async () => {
+    const codexHome = await createTempDir("codlogs-opencode-home-");
+    await fs.writeFile(path.join(codexHome, "session_index.jsonl"), [
+      { id: "codex-session-1", thread_name: "Old name" },
+      { id: "another-session", thread_name: "Unrelated" },
+      { id: "codex-session-1", thread_name: "Renamed thread" },
+    ].map(row => JSON.stringify(row)).join("\n"));
+
+    const first = await exportRows(transcript, { codexHome, includeToolCallResults: true });
+    const second = await exportRows(transcript, { codexHome, includeToolCallResults: true });
+
+    expect(first.info.title).toBe("Renamed thread");
+    // OpenCode reports the second import of a session as a conflict instead of adding a copy.
+    expect(second.info.id).toBe(first.info.id);
+    expect(second.messages.map(message => message.id)).toEqual(first.messages.map(message => message.id));
+  });
+
+  test("builds identifiers with the layout of OpenCode 2.3", () => {
+    // Timestamp and counter prefixes of identifiers that OpenCode 2.3.0 created.
+    const message = buildOpenCodeIdentifier({
+      prefix: "msg", timestampMs: 1794882744955, counter: 1, descending: false, seed: "seed",
+    });
+    const session = buildOpenCodeIdentifier({
+      prefix: "ses", timestampMs: 1794882744921, counter: 1, descending: true, seed: "seed",
+    });
+
+    expect(message).toMatch(/^msg_1e759327b001[0-9A-Za-z]{14}$/);
+    expect(session).toMatch(/^ses_e18a6cda6ffe[0-9A-Za-z]{14}$/);
+    expect(buildOpenCodeIdentifier({
+      prefix: "msg", timestampMs: 1794882744955, counter: 1, descending: false, seed: "other",
+    })).not.toBe(message);
+  });
+
+  test("Node CLI writes an OpenCode session file", async () => {
+    const file = await writeSession(transcript);
+    const cli = path.resolve(import.meta.dir, "../../codlogs-sessions.ts");
+    const run = (args: string[]) => execFileSync(
+      "node", ["--no-warnings", "--experimental-strip-types", cli, ...args],
+      { windowsHide: true, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+
+    const stdout = run(["--opencode", file, "--include-tool-results", "--codex-home", path.dirname(file)]);
+    const outputPath = file.replace(/\.jsonl$/, ".opencode.json");
+    const data = JSON.parse(await fs.readFile(outputPath, "utf8"));
+
+    expect(stdout).toContain(`opencode session import "${outputPath}"`);
+    expectImportable(data);
+    expect(data.messages.filter((message: any) => message.type === "assistant")).toHaveLength(3);
+    expect(() => run(["--opencode", file, "--md", file])).toThrow(/Use only one of/);
   });
 });
