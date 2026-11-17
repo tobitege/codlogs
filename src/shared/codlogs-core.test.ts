@@ -1752,6 +1752,22 @@ describe("OpenCode session export", () => {
     expect(data.info.title).toBe("First");
   });
 
+  test("keeps row times when the session metadata has no start time", async () => {
+    const directory = await createTempDir("codlogs-opencode-");
+    const file = path.join(directory, "rollout.jsonl");
+    const meta = { type: "session_meta", payload: { id: "codex-session-2", cwd: directory } };
+    await fs.writeFile(file, [meta, user(1, text("First")), assistant(2, "One")].map(row => JSON.stringify(row)).join("\n"));
+    // The file time is only a stand-in for rows without a time; it must not move rows that have one.
+    const later = new Date(at(3600));
+    await fs.utimes(file, later, later);
+
+    const data = JSON.parse(await fs.readFile(await exportSessionJsonlToOpenCode(file), "utf8"));
+
+    expectImportable(data);
+    expect(data.messages.map((message: any) => message.time.created)).toEqual([at(1), at(2), at(2)]);
+    expect(data.info.time).toEqual({ created: at(1), updated: at(2), idle: at(2), viewed: at(2) });
+  });
+
   test("keeps a readable compaction summary and skips an opaque one", async () => {
     const data = await exportRows([
       user(1, text("First")), assistant(2, "One"),

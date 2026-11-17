@@ -187,7 +187,8 @@ export function createOpenCodeSessionConverter(
   const queue: PendingMessage[] = [];
   const pendingCalls = new Map<string, PendingToolCall>();
 
-  let lastTimestampMs = startedAtMs ?? options.fallbackTimestampMs;
+  // The fallback stands in only while neither the session start nor a row has supplied a time.
+  let lastTimestampMs: number | null = startedAtMs;
   let firstRecordTimestampMs: number | null = null;
   let idTimestampMs = 0;
   let idCounter = 0;
@@ -210,9 +211,9 @@ export function createOpenCodeSessionConverter(
     const parsed = parseTimestampMs(value);
     if (parsed !== null) {
       firstRecordTimestampMs ??= parsed;
-      lastTimestampMs = Math.max(lastTimestampMs, parsed);
+      lastTimestampMs = Math.max(lastTimestampMs ?? parsed, parsed);
     }
-    return lastTimestampMs;
+    return lastTimestampMs ?? options.fallbackTimestampMs;
   }
 
   function nextMessageId(timestampMs: number): string {
@@ -532,7 +533,7 @@ export function createOpenCodeSessionConverter(
       ...(lastOutcome ? { outcome: lastOutcome } : {}),
       time: {
         created: createdMs,
-        updated: Math.max(createdMs, lastTimestampMs),
+        updated: Math.max(createdMs, lastTimestampMs ?? createdMs),
         ...(lastIdleMs !== null ? { idle: lastIdleMs, viewed: lastIdleMs } : {}),
       },
       title,
@@ -591,7 +592,7 @@ export function createOpenCodeSessionConverter(
     },
     finish() {
       // A turn that Codex never closed was cut off; without turn events the last answer counts as complete.
-      endTurn(lastTimestampMs, sawTurnEvents ? "interrupted" : "succeeded");
+      endTurn(lastTimestampMs ?? options.fallbackTimestampMs, sawTurnEvents ? "interrupted" : "succeeded");
       return { messages: flush(), info: buildInfo() };
     },
   };
