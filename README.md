@@ -232,6 +232,7 @@ Notes:
 
 - Export a session as an OpenCode 2 session file for `opencode session import`: `Export OpenCode` in the desktop app and `--opencode FILE` in the CLI. The existing options for images and for tool calls and results apply.
 - Fixed the rows that the Codex app writes when one of its pages is opened (`<external_codex_apps_open_page>`) being treated as prompts. They are left out of the Markdown, HTML and OpenCode exports and no longer count as prompts.
+- Updated Electrobun to 2.0.6, React and React DOM to 19.3.1 and @types/bun to 1.4.4.
 
 ### [1.4.2] - 2026-11-09
 
