@@ -10,6 +10,7 @@ import {
   type ExportProgress,
   exportSessionJsonlToMarkdown,
   exportSessionJsonlToHtml,
+  exportSessionJsonlToOpenCode,
   findCodexSessions,
   getSessionDetailMetrics,
   mergeErroredToolCallPatterns,
@@ -484,30 +485,42 @@ async function renameSessionThreadName(options: {
   return { threadName: normalizedThreadName };
 }
 
+const EXPORT_JOB_LABELS = {
+  markdown: "Markdown",
+  html: "HTML",
+  opencode: "OpenCode session file",
+} as const;
+
 function startExportJob(options: {
-  format: "markdown" | "html";
+  format: "markdown" | "html" | "opencode";
   sessionFilePath: string;
   includeImages: boolean;
   inlineImages: boolean;
   includeToolCallResults: boolean;
   outputDirectory: string | null;
   outputPath: string | null;
+  codexHome?: string | null;
 }): { jobId: string } {
   const jobId = crypto.randomUUID();
   const controller = new AbortController();
+  const label = EXPORT_JOB_LABELS[options.format];
   exportJobs.set(jobId, {
     controller,
     status: {
       kind: "working",
       progressPercent: 2,
       stage: "reading",
-      message: `Preparing ${options.format === "markdown" ? "Markdown" : "HTML"} export...`,
+      message: `Preparing ${label} export...`,
       outputPath: null,
     },
   });
 
   void (async () => {
     try {
+      const runtimeOptions = {
+        signal: controller.signal,
+        onProgress: (progress: ExportProgress) => updateExportJobProgress(jobId, progress),
+      };
       const outputPath =
         options.format === "markdown"
           ? await exportSessionJsonlToMarkdown(
@@ -517,30 +530,35 @@ function startExportJob(options: {
                 includeToolCallResults: options.includeToolCallResults,
                 outputDirectory: options.outputDirectory,
               },
-              {
-                signal: controller.signal,
-                onProgress: (progress) => updateExportJobProgress(jobId, progress),
-              },
+              runtimeOptions,
             )
-          : await exportSessionJsonlToHtml(
-              options.sessionFilePath,
-              {
-                includeImages: options.includeImages,
-                inlineImages: options.inlineImages,
-                includeToolCallResults: options.includeToolCallResults,
-                outputDirectory: options.outputDirectory,
-                outputPath: options.outputPath,
-              },
-              {
-                signal: controller.signal,
-                onProgress: (progress) => updateExportJobProgress(jobId, progress),
-              },
-            );
+          : options.format === "opencode"
+            ? await exportSessionJsonlToOpenCode(
+                options.sessionFilePath,
+                {
+                  includeImages: options.includeImages,
+                  includeToolCallResults: options.includeToolCallResults,
+                  outputDirectory: options.outputDirectory,
+                  codexHome: resolveCodexHomePath(options.codexHome),
+                },
+                runtimeOptions,
+              )
+            : await exportSessionJsonlToHtml(
+                options.sessionFilePath,
+                {
+                  includeImages: options.includeImages,
+                  inlineImages: options.inlineImages,
+                  includeToolCallResults: options.includeToolCallResults,
+                  outputDirectory: options.outputDirectory,
+                  outputPath: options.outputPath,
+                },
+                runtimeOptions,
+              );
       setExportJobStatus(jobId, {
         kind: "success",
         progressPercent: 100,
         stage: "done",
-        message: `${options.format === "markdown" ? "Markdown" : "HTML"} written to ${outputPath}`,
+        message: `${label} written to ${outputPath}`,
         outputPath,
       });
       Utils.showNotification({
@@ -1890,6 +1908,23 @@ const rpc = BrowserView.defineRPC<CodexerRPC>({
           includeToolCallResults,
           outputDirectory,
           outputPath,
+        }),
+      startSessionOpenCodeExport: async ({
+        sessionFilePath,
+        codexHome,
+        includeImages,
+        includeToolCallResults,
+        outputDirectory,
+      }) =>
+        startExportJob({
+          format: "opencode",
+          sessionFilePath,
+          includeImages,
+          inlineImages: false,
+          includeToolCallResults,
+          outputDirectory,
+          outputPath: null,
+          codexHome,
         }),
       startSessionSanitizedCopy: async ({
         sessionFilePath,

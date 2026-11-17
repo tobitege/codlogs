@@ -3,6 +3,7 @@ import {
   DEFAULT_CODEX_HOME,
   exportSessionJsonlToHtml,
   exportSessionJsonlToMarkdown,
+  exportSessionJsonlToOpenCode,
   findCodexSessions,
   type FindCodexSessionsResult,
 } from "./src/shared/codlogs-core.ts";
@@ -15,6 +16,7 @@ type ParsedOptions = {
   htmlExportPath: string | null;
   json: boolean;
   markdownExportPath: string | null;
+  openCodeExportPath: string | null;
   targetDirectory: string | null;
 };
 
@@ -38,6 +40,18 @@ async function main(): Promise<void> {
       includeToolCallResults: options.includeToolCallResults,
     });
     console.log(`Wrote HTML export: ${htmlPath}`);
+    return;
+  }
+
+  if (options.openCodeExportPath !== null) {
+    const openCodePath = await exportSessionJsonlToOpenCode(options.openCodeExportPath, {
+      includeImages: options.includeImages,
+      includeToolCallResults: options.includeToolCallResults,
+      codexHome: options.codexHome,
+    });
+    console.log(`Wrote OpenCode session file: ${openCodePath}`);
+    console.log(`Import it with: opencode session import "${openCodePath}"`);
+    console.log("Or in the OpenCode desktop app: open the More options menu of a project in the sidebar and choose Import session.");
     return;
   }
 
@@ -65,6 +79,7 @@ function parseArgs(args: string[], commandName: string): ParsedOptions {
     htmlExportPath: null,
     json: false,
     markdownExportPath: null,
+    openCodeExportPath: null,
     targetDirectory: null,
   };
 
@@ -113,6 +128,17 @@ function parseArgs(args: string[], commandName: string): ParsedOptions {
       continue;
     }
 
+    if (argument === "--opencode") {
+      const nextArgument = args[index + 1];
+      if (!nextArgument) {
+        throw new Error("Missing value after --opencode");
+      }
+
+      options.openCodeExportPath = nextArgument;
+      index += 1;
+      continue;
+    }
+
     if (argument === "--codex-home") {
       const nextArgument = args[index + 1];
       if (!nextArgument) {
@@ -141,27 +167,28 @@ function parseArgs(args: string[], commandName: string): ParsedOptions {
     throw new Error(`Unknown argument: ${argument}`);
   }
 
-  if (
-    (options.markdownExportPath !== null || options.htmlExportPath !== null) &&
-    options.targetDirectory !== null
-  ) {
+  const exportFlagCount = [
+    options.markdownExportPath,
+    options.htmlExportPath,
+    options.openCodeExportPath,
+  ].filter((exportPath) => exportPath !== null).length;
+
+  if (exportFlagCount > 0 && options.targetDirectory !== null) {
     throw new Error("Use either [folder] or an export flag, not both");
   }
 
-  if (options.markdownExportPath !== null && options.htmlExportPath !== null) {
-    throw new Error("Use either --md FILE or --html FILE, not both");
+  if (exportFlagCount > 1) {
+    throw new Error("Use only one of --md FILE, --html FILE or --opencode FILE");
   }
 
-  if ((options.markdownExportPath !== null || options.htmlExportPath !== null) && options.json) {
+  if (exportFlagCount > 0 && options.json) {
     throw new Error("--json cannot be combined with export flags");
   }
 
-  if (
-    options.markdownExportPath === null &&
-    options.htmlExportPath === null &&
-    (options.includeImages || options.includeToolCallResults)
-  ) {
-    throw new Error("--include-images and --include-tool-results require --md FILE or --html FILE");
+  if (exportFlagCount === 0 && (options.includeImages || options.includeToolCallResults)) {
+    throw new Error(
+      "--include-images and --include-tool-results require --md FILE, --html FILE or --opencode FILE",
+    );
   }
 
   return options;
@@ -174,14 +201,18 @@ function printHelp(commandName: string): void {
       `  ${commandName} [folder] [--json] [--cwd-only] [--codex-home PATH]`,
       `  ${commandName} --md FILE.jsonl [--include-images] [--include-tool-results]`,
       `  ${commandName} --html FILE.jsonl [--include-images] [--include-tool-results]`,
+      `  ${commandName} --opencode FILE.jsonl [--include-images] [--include-tool-results] [--codex-home PATH]`,
       "",
       "Options:",
       "  folder                 Optional folder or repo to inspect. Defaults to the current directory.",
       "  --json                 Print machine-readable JSON.",
       "  --md FILE.jsonl        Convert one Codex session JSONL file into a same-named Markdown file.",
       "  --html FILE.jsonl      Convert one Codex session JSONL file into a same-named HTML file.",
+      "  --opencode FILE.jsonl  Convert one Codex session JSONL file into a same-named .opencode.json",
+      "                         session file for `opencode session import` (OpenCode 2).",
       "  --include-images       With --md or --html, export embedded images into a sibling .assets folder.",
-      "  --include-tool-results With --md or --html, include tool calls and tool outputs in the exported transcript.",
+      "                         With --opencode, embed them in the session file.",
+      "  --include-tool-results With an export flag, include tool calls and tool outputs in the export.",
       "  --cwd-only             Match only the current folder tree, even if a git repo root exists.",
       "  --codex-home PATH      Override the Codex home folder. Defaults to %CODEX_HOME% or ~/.codex.",
       "  -h, --help             Show this help text.",

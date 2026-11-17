@@ -4,6 +4,11 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+  createOpenCodeSessionConverter,
+  OPENCODE_SESSION_FILE_SUFFIX,
+  type OpenCodeMessage,
+} from "./opencode-session.ts";
 
 export type SessionKind = "live" | "archived";
 export type ScopeMode = "repo" | "cwd" | "all";
@@ -175,6 +180,14 @@ export type HtmlExportOptions = {
   outputPath?: string | null;
 };
 
+export type OpenCodeExportOptions = {
+  includeImages?: boolean;
+  includeToolCallResults?: boolean;
+  outputDirectory?: string | null;
+  // Codex home whose session_index.jsonl names the session; without it the first prompt becomes the title.
+  codexHome?: string | null;
+};
+
 export type ExportProgress = {
   stage: "reading" | "parsing" | "rendering" | "writing";
   message: string;
@@ -234,8 +247,10 @@ type ExportImageAsset = {
   data: Uint8Array;
 };
 
+type ExportFormat = "markdown" | "html" | "opencode";
+
 type ExportRenderContext = {
-  format: "markdown" | "html";
+  format: ExportFormat;
   assetDirectoryName: string;
   assets: ExportImageAsset[];
   nextImageIndex: number;
@@ -893,7 +908,7 @@ export async function getSessionDetailMetrics(
       }
 
       const messageText = extractMessageLikeText(item.content);
-      if (!looksLikeBootstrapContext(messageText)) {
+      if (!looksLikeBootstrapContext(messageText) && !isCodexAppPageEvent(messageText)) {
         responseItemUserMessages += 1;
       }
       continue;
@@ -1395,10 +1410,37 @@ export async function exportSessionJsonlToHtml(
   return exportSessionStreamed(sessionFilePath, "html", options, runtimeOptions);
 }
 
+/**
+ * Writes `<session>.opencode.json`, a session file that `opencode session import`
+ * of OpenCode 2 accepts.
+ */
+export async function exportSessionJsonlToOpenCode(
+  inputPath: string,
+  options: OpenCodeExportOptions = {},
+  runtimeOptions: ExportRuntimeOptions = {},
+): Promise<string> {
+  const sessionFilePath = resolveFilesystemPath(inputPath);
+  if (!(await pathExists(sessionFilePath))) {
+    throw new Error(`Session file not found: ${sessionFilePath}`);
+  }
+
+  if (path.extname(sessionFilePath).toLowerCase() !== ".jsonl") {
+    throw new Error(`Expected a .jsonl file: ${sessionFilePath}`);
+  }
+
+  return exportSessionStreamed(sessionFilePath, "opencode", options, runtimeOptions);
+}
+
+const EXPORT_FORMATS = {
+  markdown: { label: "Markdown", fileSuffix: ".md" },
+  html: { label: "HTML", fileSuffix: ".html" },
+  opencode: { label: "OpenCode", fileSuffix: OPENCODE_SESSION_FILE_SUFFIX },
+} as const;
+
 async function exportSessionStreamed(
   sessionFilePath: string,
-  format: "markdown" | "html",
-  options: HtmlExportOptions,
+  format: ExportFormat,
+  options: HtmlExportOptions & OpenCodeExportOptions,
   runtimeOptions: ExportRuntimeOptions,
 ): Promise<string> {
   throwIfExportCancelled(runtimeOptions.signal);
@@ -1413,19 +1455,35 @@ async function exportSessionStreamed(
     ? ensureHtmlOutputPath(resolveFilesystemPath(explicitOutputPath))
     : path.join(
         outputDirectory ? resolveFilesystemPath(outputDirectory) : path.dirname(sessionFilePath),
-        `${path.parse(sessionFilePath).name}.${format === "html" ? "html" : "md"}`,
+        `${path.parse(sessionFilePath).name}${EXPORT_FORMATS[format].fileSuffix}`,
       );
   const outputDirectoryPath = path.dirname(outputPath);
   const assetDirectoryName = `${path.parse(outputPath).name}.assets`;
   const exportId = randomUUID();
   // Each run owns its sidecars; old exports keep their original image bytes.
   const assetGenerationName = `${assetDirectoryName}/${exportId}`;
-  const assetDirectoryPath = normalizedOptions.includeImages && !normalizedOptions.inlineImages
-    ? path.join(outputDirectoryPath, assetGenerationName)
-    : null;
+  // An OpenCode session file carries its images inline.
+  const assetDirectoryPath =
+    format !== "opencode" && normalizedOptions.includeImages && !normalizedOptions.inlineImages
+      ? path.join(outputDirectoryPath, assetGenerationName)
+      : null;
   const sessionMeta = await readSessionExportMetadata(sessionFilePath);
-  const fileSizeBytes = (await fs.stat(sessionFilePath)).size;
-  const label = format === "html" ? "HTML" : "Markdown";
+  const sessionFileStats = await fs.stat(sessionFilePath);
+  const fileSizeBytes = sessionFileStats.size;
+  const label = EXPORT_FORMATS[format].label;
+  const converter = format === "opencode"
+    ? createOpenCodeSessionConverter({
+        sessionId: sessionMeta.id,
+        cwd: sessionMeta.cwd,
+        startedAt: sessionMeta.startedAt,
+        modelProvider: sessionMeta.modelProvider,
+        cliVersion: sessionMeta.cliVersion,
+        title: await readCodexThreadName(options.codexHome, sessionMeta.id),
+        includeImages: normalizedOptions.includeImages,
+        includeToolCallResults: normalizedOptions.includeToolCallResults,
+        fallbackTimestampMs: Math.trunc(sessionFileStats.mtimeMs),
+      })
+    : null;
   await reportExportProgress(runtimeOptions, {
     stage: "reading", message: `Preparing ${label} export...`, progressPercent: 4,
   });
@@ -1440,28 +1498,50 @@ async function exportSessionStreamed(
   };
   let transcriptEntryCount = 0;
   let lastProgressBytes = 0;
+  // One message per line; the session info follows the messages because its totals are known only at the end.
+  const writeOpenCodeMessages = async (messages: OpenCodeMessage[]): Promise<void> => {
+    for (const message of messages) {
+      await file.writeFile(`${transcriptEntryCount > 0 ? ",\n" : ""}    ${JSON.stringify(message)}`);
+      transcriptEntryCount += 1;
+    }
+  };
   try {
-    await file.writeFile(format === "html"
-      ? buildHtmlExportPrefix(sessionFilePath, sessionMeta, normalizedOptions, assetDirectoryName)
-      : buildMarkdownExportPrefix(sessionFilePath, sessionMeta, normalizedOptions));
+    await file.writeFile(converter
+      ? '{\n  "messages": [\n'
+      : format === "html"
+        ? buildHtmlExportPrefix(sessionFilePath, sessionMeta, normalizedOptions, assetDirectoryName)
+        : buildMarkdownExportPrefix(sessionFilePath, sessionMeta, normalizedOptions));
     for await (const event of streamJsonlRecords(sessionFilePath, {
       signal: runtimeOptions.signal, maxLineBytes: EXPORT_MAX_JSONL_LINE_BYTES, oversizedStrategy: "throw",
     })) {
       if (event.kind !== "record") continue;
       throwIfExportCancelled(runtimeOptions.signal);
-      const rendered = renderExportEntry(event.record, context);
-      if (rendered) {
-        await file.writeFile(`${rendered}\n\n`);
-        transcriptEntryCount += 1;
+      if (converter) {
+        const item = event.record.type === "response_item" ? asObject(event.record.payload) : null;
+        const isMessage = item?.type === "message";
+        if (!isMessage || !isHiddenExportMessage(item, context)) {
+          if (isMessage) context.hasConversation = true;
+          await writeOpenCodeMessages(converter.push(event.record));
+        }
+      } else {
+        const rendered = renderExportEntry(event.record, context);
+        if (rendered) {
+          await file.writeFile(`${rendered}\n\n`);
+          transcriptEntryCount += 1;
+        }
+        await flushRenderAssets(assetDirectoryPath, context.assets, runtimeOptions.signal);
+        context.assets.length = 0;
       }
-      await flushRenderAssets(assetDirectoryPath, context.assets, runtimeOptions.signal);
-      context.assets.length = 0;
       lastProgressBytes = await maybeReportByteProgress(
         runtimeOptions, event.bytesProcessed, fileSizeBytes, lastProgressBytes,
         { stage: "rendering", startPercent: 10, endPercent: 82, message: `Rendering ${label} transcript...` },
       );
     }
-    if (transcriptEntryCount === 0) {
+    if (converter) {
+      const { messages, info } = converter.finish();
+      await writeOpenCodeMessages(messages);
+      await file.writeFile(`\n  ],\n  "info": ${JSON.stringify(info)}\n}\n`);
+    } else if (transcriptEntryCount === 0) {
       await file.writeFile(format === "html"
         ? "<p><em>No transcript items were found in the response stream.</em></p>\n"
         : "_No transcript items were found in the response stream._\n");
@@ -1513,9 +1593,7 @@ function renderExportEntry(record: JsonlRecord, context: ExportRenderContext): s
   if (!item) return null;
   const html = context.format === "html";
   if (item.type === "message") {
-    if (item.role === "developer" || item.role === "system") return null;
-    const text = extractMessageLikeText(item.content);
-    if (item.role === "user" && !context.hasConversation && isExportBootstrapContext(text)) return null;
+    if (isHiddenExportMessage(item, context)) return null;
     const rendered = html ? renderHtmlMessageEntry(record, item, context) : renderMessageEntry(record, item, context);
     if (rendered) context.hasConversation = true;
     return rendered;
@@ -1536,6 +1614,41 @@ function renderExportEntry(record: JsonlRecord, context: ExportRenderContext): s
     default:
       return null;
   }
+}
+
+// Every export format leaves out instructions, the bootstrap context that precedes the first prompt
+// and the page events of the Codex app.
+function isHiddenExportMessage(
+  item: Record<string, unknown>,
+  context: Pick<ExportRenderContext, "hasConversation">,
+): boolean {
+  if (item.role === "developer" || item.role === "system") return true;
+  if (item.role !== "user") return false;
+  const text = extractMessageLikeText(item.content);
+  return isCodexAppPageEvent(text) || (!context.hasConversation && isExportBootstrapContext(text));
+}
+
+/**
+ * True for the row that the Codex app writes when one of its pages is opened. Codex stores it as
+ * a user message, but nobody typed it and it says nothing about the conversation.
+ */
+function isCodexAppPageEvent(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.startsWith("<external_codex_apps_open_page>") &&
+    trimmed.endsWith("</external_codex_apps_open_page>");
+}
+
+async function readCodexThreadName(
+  codexHome: string | null | undefined,
+  sessionId: string,
+): Promise<string | null> {
+  const home = normalizeOptionalPathInput(codexHome);
+  if (!home) {
+    return null;
+  }
+
+  const index = await readSessionIndex(path.join(resolveFilesystemPath(home), "session_index.jsonl"));
+  return index.get(sessionId)?.threadName ?? null;
 }
 
 function isExportBootstrapContext(text: string): boolean {

@@ -14,8 +14,8 @@
 
 `codlogs` is a read-only Codex session tool with two entry points:
 
-- a global CLI for finding sessions and exporting one `.jsonl` session to Markdown or HTML
-- an Electrobun desktop browser for scanning sessions, filtering by folder, and exporting the selected session to `.md` or `.html`
+- a global CLI for finding sessions and exporting one `.jsonl` session to Markdown, HTML or an OpenCode 2 session file
+- an Electrobun desktop browser for scanning sessions, filtering by folder, and exporting the selected session to `.md`, `.html` or `.opencode.json`
 
 Planning and investigation artifacts for this repo live under `devlog/YYYY-MM-DD/`.
 
@@ -52,6 +52,7 @@ codlogs /mnt/d/github/myDUDreamTool
 codlogs --md C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl
 codlogs --html C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl
 codlogs --md C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl --include-images --include-tool-results
+codlogs --opencode C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl --include-images --include-tool-results
 ```
 
 Notes:
@@ -64,7 +65,8 @@ Notes:
 - use `--codex-home PATH` if your Codex data lives somewhere other than `%CODEX_HOME%` or `~/.codex`
 - use `--include-images` with `--md` or `--html` to write embedded images into a sibling `.assets` folder
 - use `--html` to export a session as an HTML transcript; with `--include-images`, codlogs writes a sibling `.assets` folder
-- use `--include-tool-results` with `--md` or `--html` to include tool calls and tool outputs in the export
+- use `--include-tool-results` with `--md`, `--html` or `--opencode` to include tool calls and tool outputs in the export
+- use `--opencode` to write a `.opencode.json` session file for OpenCode 2; see [OpenCode Session Export](#opencode-session-export)
 - Windows drive paths, WSL `/mnt/<drive>/...` paths, and WSL UNC paths are treated as aliases of the same repo
 
 ## Desktop App
@@ -108,7 +110,7 @@ Current desktop app highlights:
 
 - scans live and archived Codex sessions from `~/.codex` or `%CODEX_HOME%`
 - filters by current folder tree or repo root and can include cross-session writes
-- exports the selected session to Markdown or HTML
+- exports the selected session to Markdown, HTML or an OpenCode 2 session file
 - summarizes token usage for one selected session or all currently filtered sessions
 - summarizes distinct errored tool calls across filtered sessions
 - shows a collapsible environment status section for:
@@ -190,7 +192,47 @@ Compatibility notes:
 - preserving both opaque compaction rows and `type: "compacted"` rows is intentional because Codex resume compatibility depends on them
 - after a successful sanitize run, the desktop UI refreshes the session list automatically
 
+## OpenCode Session Export
+
+codlogs can write a Codex session as a session file for [OpenCode](https://opencode.ai/) 2, so the conversation can be read and continued there. Use `Export OpenCode` in the desktop app or `--opencode` on the command line:
+
+```powershell
+codlogs --opencode C:\Users\tobitege\.codex\sessions\2026\03\06\session.jsonl --include-images --include-tool-results
+```
+
+The file is written next to the session as `<session>.opencode.json`, or into the folder chosen in the desktop app.
+
+Import the file in OpenCode in one of two ways:
+
+- In the OpenCode desktop app: in the sidebar under `Projects`, open the `⋯` menu (`More options`) of the project the session should belong to, choose `Import session` and pick the file.
+- On the command line: `opencode session import <file> --directory <project folder>`. OpenCode attaches the session to the project of `--directory`, or of the current folder without it. With only the desktop app installed, `opencode` is not on the PATH; on Windows its command line program is `%LOCALAPPDATA%\Programs\ai.opencode.desktop\resources\opencode-cli.exe`.
+
+What the file contains:
+
+- each prompt as a user message; with `--include-images`, its images are embedded as attachments
+- each model response as an assistant message with its reasoning summaries and text, under the Codex model name and provider
+- with `--include-tool-results`, each tool call with its input and output; a call without a recorded output is marked as failed
+- an idle marker where Codex ended a turn, with the outcome `succeeded`, `failed` or `interrupted`
+- the Codex thread name as the session title (the first prompt if the thread has no name), the start time and the token totals
+- a compaction summary where an older Codex version stored one as text
+
+Notes:
+
+- include tool calls and results when the session is meant to be continued; without them OpenCode sees only the prompts and answers
+- instructions, developer messages, the bootstrap context and the rows that the Codex app writes when one of its pages is opened (`<external_codex_apps_open_page>`) are left out, as in the Markdown and HTML exports
+- only images embedded in the session are exported; image links are skipped
+- the session and message identifiers are derived from the Codex session, so importing the same session again reports `Session already exists`; delete the imported session in OpenCode first to import a newer export
+- Codex tool names such as `exec` or `apply_patch` are kept as they are; OpenCode shows these calls but has no tools of the same name
+- OpenCode reads the whole file into memory during the import, so a session with many images needs correspondingly more memory there
+- the format follows `opencode session export` of OpenCode 2.3 and was tested against `opencode session import` of that version
+
 ## Changelog
+
+### [1.5.0] - 2026-11-17
+
+- Export a session as an OpenCode 2 session file for `opencode session import`: `Export OpenCode` in the desktop app and `--opencode FILE` in the CLI. The existing options for images and for tool calls and results apply.
+- Fixed the rows that the Codex app writes when one of its pages is opened (`<external_codex_apps_open_page>`) being treated as prompts. They are left out of the Markdown, HTML and OpenCode exports and no longer count as prompts.
+- Updated Electrobun to 2.0.6, React and React DOM to 19.3.1 and @types/bun to 1.4.4.
 
 ### [1.4.2] - 2026-11-09
 

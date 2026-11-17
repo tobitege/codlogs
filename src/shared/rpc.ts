@@ -172,6 +172,18 @@ export type CodexerRPC = {
           jobId: string;
         };
       };
+      startSessionOpenCodeExport: {
+        params: {
+          sessionFilePath: string;
+          codexHome: string | null;
+          includeImages: boolean;
+          includeToolCallResults: boolean;
+          outputDirectory: string | null;
+        };
+        response: {
+          jobId: string;
+        };
+      };
       startSessionSanitizedCopy: {
         params: {
           sessionFilePath: string;
