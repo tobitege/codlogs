@@ -39,7 +39,7 @@
   },
   "dependencies": {
     "react": "^19.3.0",
-    "react-dom": "^19.3.0"
+    "react-dom": "^19.3.1"
   },
   "devDependencies": {
     "electrobun": "2.0.2",
