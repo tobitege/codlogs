@@ -908,7 +908,7 @@ export async function getSessionDetailMetrics(
       }
 
       const messageText = extractMessageLikeText(item.content);
-      if (!looksLikeBootstrapContext(messageText)) {
+      if (!looksLikeBootstrapContext(messageText) && !isCodexAppPageEvent(messageText)) {
         responseItemUserMessages += 1;
       }
       continue;
@@ -1616,14 +1616,26 @@ function renderExportEntry(record: JsonlRecord, context: ExportRenderContext): s
   }
 }
 
-// Every export format leaves out instructions and the bootstrap context that precedes the first prompt.
+// Every export format leaves out instructions, the bootstrap context that precedes the first prompt
+// and the page events of the Codex app.
 function isHiddenExportMessage(
   item: Record<string, unknown>,
   context: Pick<ExportRenderContext, "hasConversation">,
 ): boolean {
   if (item.role === "developer" || item.role === "system") return true;
-  return item.role === "user" && !context.hasConversation &&
-    isExportBootstrapContext(extractMessageLikeText(item.content));
+  if (item.role !== "user") return false;
+  const text = extractMessageLikeText(item.content);
+  return isCodexAppPageEvent(text) || (!context.hasConversation && isExportBootstrapContext(text));
+}
+
+/**
+ * True for the row that the Codex app writes when one of its pages is opened. Codex stores it as
+ * a user message, but nobody typed it and it says nothing about the conversation.
+ */
+function isCodexAppPageEvent(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.startsWith("<external_codex_apps_open_page>") &&
+    trimmed.endsWith("</external_codex_apps_open_page>");
 }
 
 async function readCodexThreadName(

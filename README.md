@@ -219,7 +219,7 @@ What the file contains:
 Notes:
 
 - include tool calls and results when the session is meant to be continued; without them OpenCode sees only the prompts and answers
-- instructions, developer messages and the bootstrap context are left out, as in the Markdown and HTML exports
+- instructions, developer messages, the bootstrap context and the rows that the Codex app writes when one of its pages is opened (`<external_codex_apps_open_page>`) are left out, as in the Markdown and HTML exports
 - only images embedded in the session are exported; image links are skipped
 - the session and message identifiers are derived from the Codex session, so importing the same session again reports `Session already exists`; delete the imported session in OpenCode first to import a newer export
 - Codex tool names such as `exec` or `apply_patch` are kept as they are; OpenCode shows these calls but has no tools of the same name
@@ -231,6 +231,7 @@ Notes:
 ### [1.5.0] - 2026-11-17
 
 - Export a session as an OpenCode 2 session file for `opencode session import`: `Export OpenCode` in the desktop app and `--opencode FILE` in the CLI. The existing options for images and for tool calls and results apply.
+- Fixed the rows that the Codex app writes when one of its pages is opened (`<external_codex_apps_open_page>`) being treated as prompts. They are left out of the Markdown, HTML and OpenCode exports and no longer count as prompts.
 
 ### [1.4.2] - 2026-11-09
 

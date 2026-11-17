@@ -1752,6 +1752,31 @@ describe("OpenCode session export", () => {
     expect(data.info.title).toBe("First");
   });
 
+  test("every export and the prompt count leave out the page events of the Codex app", async () => {
+    const pageEvent = '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>';
+    const rows = [
+      user(1, text(pageEvent)),
+      user(2, text("First")), assistant(3, "One"),
+      user(4, text(`\n${pageEvent}\n`)),
+      user(5, text("Second")), assistant(6, "Two"),
+    ];
+    const data = await exportRows(rows);
+
+    // A page event neither shows up as a prompt nor ends the turn before it.
+    expect(data.messages.map(message => `${message.type}:${message.text ?? message.outcome ?? message.content[0].text}`))
+      .toEqual(["user:First", "assistant:One", "idle:succeeded", "user:Second", "assistant:Two", "idle:succeeded"]);
+    expect(data.messages[2].time.created).toBe(at(5));
+    expect(data.info.title).toBe("First");
+
+    const sessionFile = await writeSession(rows);
+    expect((await getSessionDetailMetrics(sessionFile)).interactionCount).toBe(2);
+    for (const exporter of [exportSessionJsonlToMarkdown, exportSessionJsonlToHtml]) {
+      const exported = await fs.readFile(await exporter(sessionFile), "utf8");
+      expect(exported).not.toContain("external_codex_apps_open_page");
+      expect(exported).toContain("Second");
+    }
+  });
+
   test("keeps row times when the session metadata has no start time", async () => {
     const directory = await createTempDir("codlogs-opencode-");
     const file = path.join(directory, "rollout.jsonl");
